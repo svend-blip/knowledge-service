@@ -43,6 +43,7 @@ __all__ = [
     "validate_file",
     "admit",
     "retract",
+    "list_artifact_records",
     "list_artifacts",
     "rebuild",
     "build_manifests",
@@ -405,9 +406,20 @@ def retract(ref: str) -> int:
     return rebuild()
 
 
-def list_artifacts() -> int:
-    """Print one line per admitted artifact: family/run, topic, level, etc."""
+def list_artifact_records(history: bool = False) -> list[dict]:
+    """Return one plain dict per artifact, newest listing data first.
+
+    Live artifacts come from the learning directory, history artifacts from
+    its ``history`` subtree. Every record carries ``family``, ``run``,
+    ``topic``, ``evidence_level``, ``confidence``, ``admitted_by`` and
+    ``supersedes`` (a list); history records additionally carry
+    ``superseded_by`` and ``retracted_at`` as string or ``None``. Sorted by
+    ``family``, then ``run``. Pure read: nothing is written or rebuilt.
+    """
     directory = learning_dir()
+    if history:
+        directory = directory / "history"
+    records: list[dict] = []
     for artifact in _iter_artifacts(directory):
         doc, message = _load_yaml(artifact)
         if doc is None:
@@ -415,9 +427,34 @@ def list_artifacts() -> int:
             continue
         validation = doc.get("validation") or {}
         level = validation.get("evidence_level", "") if isinstance(validation, dict) else ""
+        record = {
+            "family": str(doc.get("family", "")),
+            "run": str(doc.get("run", "")),
+            "topic": str(doc.get("topic", "")),
+            "evidence_level": str(level),
+            "confidence": str(doc.get("confidence", "")),
+            "admitted_by": str(doc.get("admitted_by", "")),
+            "supersedes": [str(item) for item in (doc.get("supersedes") or [])],
+        }
+        if history:
+            record["superseded_by"] = (
+                str(doc["superseded_by"]) if doc.get("superseded_by") else None
+            )
+            record["retracted_at"] = (
+                str(doc["retracted_at"]) if doc.get("retracted_at") else None
+            )
+        records.append(record)
+    records.sort(key=lambda item: (item["family"], item["run"]))
+    return records
+
+
+def list_artifacts() -> int:
+    """Print one line per admitted artifact: family/run, topic, level, etc."""
+    for record in list_artifact_records():
         print(
-            f"{doc.get('family', '')}/{doc.get('run', '')}\t{doc.get('topic', '')}\t"
-            f"{level}\t{doc.get('confidence', '')}\t{doc.get('admitted_by', '')}"
+            f"{record['family']}/{record['run']}\t{record['topic']}\t"
+            f"{record['evidence_level']}\t{record['confidence']}\t"
+            f"{record['admitted_by']}"
         )
     return 0
 

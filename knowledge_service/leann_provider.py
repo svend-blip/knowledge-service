@@ -197,6 +197,20 @@ class LeannProvider(KnowledgeProvider):
         )
         return None
 
+    @classmethod
+    def store_exists(cls, scope: str | None = None) -> bool:
+        """Whether this scope's LEANN store sits under the index dir.
+
+        The loader binds ``<index_dir>/<scope>.leann``; the builder writes
+        that directory plus its ``*.leann.meta.json`` companion, so either
+        artefact counts as a present store.
+        """
+        name = scope or config.get_scope()
+        index_dir = Path(config.get_index_dir())
+        return (index_dir / f"{name}.leann").exists() or (
+            index_dir / f"{name}.leann.meta.json"
+        ).is_file()
+
     def search(
         self,
         query: str,
@@ -209,8 +223,9 @@ class LeannProvider(KnowledgeProvider):
         """Return knowledge results relevant to ``query``.
 
         Each result is a ``dict`` with at least ``path`` (the manifest path
-        value) and ``content`` (the passage text), plus ``score`` and
-        ``scope`` when available.
+        value) and ``content`` (the passage text), plus ``score``, ``scope``
+        when available, and ``metadata`` (the stored extras with the identity
+        keys removed).
 
         ``top_k`` bounds the number of returned results; when it is ``None``
         LEANN's own default of 5 applies. ``token_budget`` bounds the total
@@ -343,7 +358,13 @@ class LeannProvider(KnowledgeProvider):
 
     @staticmethod
     def _map_hit(hit: Any) -> dict[str, Any]:
-        """Map a LEANN search hit onto the provider-neutral result shape."""
+        """Map a LEANN search hit onto the provider-neutral result shape.
+
+        ``metadata`` carries the passage's stored extra metadata with the
+        identity keys removed: they already sit on the result itself, and a
+        consumer must not see ``path``/``scope`` twice. Repository passages
+        carry no extras, so their metadata is the empty mapping.
+        """
         metadata = getattr(hit, "metadata", None) or {}
         path = metadata.get("path") or getattr(hit, "id", None)
         return {
@@ -351,6 +372,11 @@ class LeannProvider(KnowledgeProvider):
             "content": getattr(hit, "text", ""),
             "score": float(getattr(hit, "score", 0.0)),
             "scope": metadata.get("scope"),
+            "metadata": {
+                key: value
+                for key, value in metadata.items()
+                if key not in {"id", "path", "scope"}
+            },
         }
 
     @staticmethod

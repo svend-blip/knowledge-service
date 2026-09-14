@@ -10,10 +10,11 @@ can never make the endpoint exceed the configured result bound.
 
 Response shapes and status codes are the ones DPMtF's
 ``/api/knowledge/search`` carries today: the disabled envelope, 403 with
-``detail`` on a denied scope, 503 with ``detail`` on ``ProviderNotReady``,
-and 400 on bad input. When ``[service] token`` is set, every route except
-``/v1/health`` requires the ``X-Knowledge-Token`` header. Every search that
-reaches a provider writes exactly one retrieval-log row.
+``detail`` on a denied scope, 404 with ``detail`` on a scope the registry
+does not know, 503 with ``detail`` when a store or the provider is missing
+or not ready, and 400 on bad input. When ``[service] token`` is set, every
+route except ``/v1/health`` requires the ``X-Knowledge-Token`` header. Every
+search that reaches a provider writes exactly one retrieval-log row.
 
 The HTTP framework is imported inside :func:`create_app`, not at module
 scope, so importing this module on a machine without the optional server
@@ -72,6 +73,25 @@ def _learning_scope_is_empty(scope: str) -> bool:
     if row is not None and int(row["document_count"]) == 0:
         return True
     return not knowledge_maintenance.learning_store_present(scope)
+
+
+def _registry_has_scope(scope: str) -> bool:
+    """Whether the registry knows this scope at all.
+
+    A database the service cannot open at all is no evidence against the
+    scope, so the normal search path continues; only a database that answers
+    "no row" produces the 404 below.
+    """
+    try:
+        conn = db.connect()
+        try:
+            return conn.execute(
+                "SELECT 1 FROM knowledge_indexes WHERE scope = ?", (scope,)
+            ).fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:
+        return True
 
 
 def _stderr_from_system_exit(exc: SystemExit) -> str:
@@ -139,7 +159,15 @@ def search_knowledge(
     over the admitted levels. Other scopes ignore both parameters. A
     learning scope whose registry row counts zero documents, or whose store
     files are absent, answers with an empty result list and no provider
-    call.
+    call. Every other scope follows the error contract: no registry row is a
+    404, a registered scope whose store files are gone under the index dir
+    is a 503, and an ``OSError`` out of the provider's search is a 503 with
+    the exception text as ``detail`` — none of these write a retrieval-log
+    row, and no learning scope ever takes the 404 path.
+
+    Every result item carries ``metadata``: the passage's stored extras with
+    the identity keys removed (``{}`` for repository passages), passed
+    through from the provider unchanged.
     """
     from fastapi import HTTPException
 
@@ -177,6 +205,10 @@ def search_knowledge(
     if include_history and scope == "experience":
         effective_scope = "experience-history"
 
+    # Checks below work on the concrete scope name: an omitted scope means
+    # the configured one, exactly like the provider loaders bind their store.
+    lookup_scope = effective_scope if effective_scope is not None else config.get_scope()
+
     filters: dict | None = None
     if effective_scope in learning.LEARNING_SCOPES:
         filters = {"evidence_level": {"in": learning.levels_at_least(evidence_level)}}
@@ -204,8 +236,28 @@ def search_knowledge(
                 "bounded": True,
             }
 
+    elif not _registry_has_scope(lookup_scope):
+        # A scope the registry does not know has nothing to retrieve and no
+        # store to rebuild: answer the contract directly, before touching a
+        # provider, and write no retrieval-log row.
+        raise HTTPException(
+            status_code=404, detail=f"unknown scope: {lookup_scope}"
+        )
+
     provider_cls = search.resolve_provider(provider_key, scope=effective_scope)
     provider = provider_cls()
+
+    if (
+        effective_scope not in learning.LEARNING_SCOPES
+        and not provider.store_exists(lookup_scope)
+    ):
+        # The row exists but its store files are gone (deleted index dir on
+        # a rebuilt machine): a refresh fixes it, and the caller should hear
+        # that instead of a provider-level traceback.
+        raise HTTPException(
+            status_code=503,
+            detail=f"store missing for scope {lookup_scope}; refresh it",
+        )
 
     try:
         provider.preflight()
@@ -213,13 +265,18 @@ def search_knowledge(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     start = time.perf_counter()
-    results = provider.search(
-        q,
-        scope=effective_scope,
-        filters=filters,
-        top_k=top_k,
-        token_budget=token_budget,
-    )
+    try:
+        results = provider.search(
+            q,
+            scope=effective_scope,
+            filters=filters,
+            top_k=top_k,
+            token_budget=token_budget,
+        )
+    except OSError as exc:
+        # Missing store files surface as FileNotFoundError out of the
+        # provider; that is a refresh-recoverable 503, never a 500.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     duration_ms = int((time.perf_counter() - start) * 1000)
 
     # Defensive bound: never return more than the configured ``top_k``,
@@ -367,7 +424,7 @@ def health() -> dict:
 
 
 def create_app():
-    """Build the FastAPI application exposing the five ``/v1`` routes."""
+    """Build the FastAPI application exposing the six ``/v1`` routes."""
     from fastapi import Depends, FastAPI, Header
     from pydantic import BaseModel
 
@@ -431,8 +488,20 @@ def create_app():
 
     @application.get("/v1/scopes")
     async def scopes_route(_token: None = Depends(require_token)) -> list:
-        """List the known scopes with document counts and last refresh."""
+        """List the registered scopes with document counts and last refresh."""
         return list_scopes()
+
+    @application.get("/v1/learning")
+    async def learning_route(
+        history: bool = False,
+        _token: None = Depends(require_token),
+    ) -> dict:
+        """List admitted learning artifacts; ``history=true`` lists old ones.
+
+        Read-only, no scope guard: the learning scopes are public, like the
+        CLI listing.
+        """
+        return {"artifacts": learning.list_artifact_records(history)}
 
     @application.get("/v1/scope-for-path")
     async def scope_for_path_route(

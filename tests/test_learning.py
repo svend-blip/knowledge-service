@@ -24,13 +24,17 @@ from knowledge_service import search as search_module
 class RecordingProvider:
     """Stub provider recording how the learning paths use it.
 
-    Mirrors the two real-provider facts the correction demands: an empty
-    manifest is refused exactly as LEANN refuses it (``No chunks added.``),
-    and indexing leaves store files for the scope under the index dir.
+    Mirrors the real-provider facts the tests need: an empty manifest is
+    refused exactly as LEANN refuses it (``No chunks added.``), indexing
+    leaves store-marker files for the scope under the index dir, ``search``
+    returns the indexed records with a ``metadata`` mapping whose identity
+    keys are removed, and ``store_exists`` answers from the marker file.
     """
 
     index_calls: list[str] = []
     search_calls: list[dict] = []
+    records: dict[str, list[dict]] = {}
+    search_error: Exception | None = None
 
     def __init__(self, index_path: str | None = None) -> None:
         self.index_path = index_path
@@ -38,18 +42,24 @@ class RecordingProvider:
     def preflight(self) -> None:
         return None
 
+    @classmethod
+    def store_exists(cls, scope: str | None = None) -> bool:
+        name = scope or config.get_scope()
+        return (Path(config.get_index_dir()) / f"{name}.stub").is_file()
+
     def index(self, source: str) -> None:
         RecordingProvider.index_calls.append(source)
         path = Path(source)
         text = path.read_text(encoding="utf-8") if path.is_file() else ""
-        records = [line for line in text.splitlines() if line.strip()]
-        if not records:
+        lines = [line for line in text.splitlines() if line.strip()]
+        if not lines:
             raise RuntimeError("No chunks added.")
         scope = path.stem
+        RecordingProvider.records[scope] = [json.loads(line) for line in lines]
         marker_dir = Path(config.get_index_dir())
         marker_dir.mkdir(parents=True, exist_ok=True)
         (marker_dir / f"{scope}.stub").write_text(
-            "\n".join(records), encoding="utf-8"
+            "\n".join(lines), encoding="utf-8"
         )
 
     def update(self, source: str) -> None:
@@ -64,12 +74,34 @@ class RecordingProvider:
         RecordingProvider.search_calls.append(
             {"query": query, "scope": scope, "filters": filters}
         )
+        if RecordingProvider.search_error is not None:
+            raise RecordingProvider.search_error
+        name = scope or config.get_scope()
+        hits = []
+        for record in RecordingProvider.records.get(name, []):
+            metadata = record.get("metadata") or {}
+            hits.append(
+                {
+                    "path": record["path"],
+                    "content": record["content"],
+                    "score": 0.9,
+                    "scope": name,
+                    "metadata": {
+                        key: value
+                        for key, value in metadata.items()
+                        if key not in {"id", "path", "scope"}
+                    },
+                }
+            )
+        if hits:
+            return hits
         return [
             {
-                "path": "2000/029.yaml",
+                "path": "README.md",
                 "content": "alpha beta",
                 "score": 0.9,
-                "scope": scope,
+                "scope": name,
+                "metadata": {},
             }
         ]
 
@@ -100,9 +132,21 @@ def setup_service(tmp_path, monkeypatch, enabled: str = "true") -> None:
     config.reload()
     RecordingProvider.index_calls = []
     RecordingProvider.search_calls = []
+    RecordingProvider.records = {}
+    RecordingProvider.search_error = None
     monkeypatch.setitem(
         search_module.PROVIDER_LOADERS, "stub", lambda: RecordingProvider
     )
+
+
+def seed_repository_scope(tmp_path) -> None:
+    """Give the ``flowrunner`` scope a registry row and a stub store marker."""
+    maintenance.record_index(
+        "flowrunner", "stub", str(tmp_path / "repo"), 1, "changed"
+    )
+    index_dir = Path(config.get_index_dir())
+    index_dir.mkdir(parents=True, exist_ok=True)
+    (index_dir / "flowrunner.stub").write_text("seed", encoding="utf-8")
 
 
 def make_doc(**overrides) -> dict:
@@ -424,6 +468,7 @@ def test_search_filters_experience_by_evidence_level(tmp_path, monkeypatch):
     assert learning.admit(str(write_draft(tmp_path, make_doc()))) == 0
 
     client = TestClient(create_app())
+    seed_repository_scope(tmp_path)
 
     response = client.get("/v1/search", params={"q": "index", "scope": "experience"})
     assert response.status_code == 200
@@ -477,6 +522,7 @@ def test_search_include_history_targets_the_history_scope(tmp_path, monkeypatch)
     RecordingProvider.search_calls = []
 
     client = TestClient(create_app())
+    seed_repository_scope(tmp_path)
 
     response = client.get(
         "/v1/search",
@@ -610,3 +656,169 @@ def test_learning_ledger_records_every_admission(tmp_path, monkeypatch):
     ]
     assert len(lines) == 2
     assert "retracted" in lines[1]
+
+
+# ── A2-2: error contract, metadata, listing ─────────────────────────────
+
+
+def _log_row_count() -> int:
+    conn = db.connect()
+    try:
+        return len(
+            conn.execute("SELECT 1 FROM knowledge_retrieval_log").fetchall()
+        )
+    finally:
+        conn.close()
+
+
+def test_search_unknown_scope_is_404_without_a_log_row(tmp_path, monkeypatch):
+    setup_service(tmp_path, monkeypatch)
+    client = TestClient(create_app())
+
+    response = client.get(
+        "/v1/search", params={"q": "x", "scope": "no-such-scope-xyz"}
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"] == "unknown scope: no-such-scope-xyz"
+    assert _log_row_count() == 0
+
+    # Learning scopes keep the 200-empty behaviour even before any admit.
+    response = client.get("/v1/search", params={"q": "x", "scope": "experience"})
+    assert response.status_code == 200
+    assert response.json()["results"] == []
+    assert _log_row_count() == 1
+
+
+def test_search_known_scope_with_missing_store_is_503(tmp_path, monkeypatch):
+    setup_service(tmp_path, monkeypatch)
+    maintenance.record_index("notes", "stub", str(tmp_path / "repo"), 3, "changed")
+    client = TestClient(create_app())
+
+    response = client.get("/v1/search", params={"q": "x", "scope": "notes"})
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "store missing for scope notes; refresh it"
+    )
+    assert RecordingProvider.search_calls == []
+    assert _log_row_count() == 0
+
+    # A present store marker opens the normal path again.
+    index_dir = Path(config.get_index_dir())
+    index_dir.mkdir(parents=True, exist_ok=True)
+    (index_dir / "notes.stub").write_text("{}", encoding="utf-8")
+    response = client.get("/v1/search", params={"q": "x", "scope": "notes"})
+    assert response.status_code == 200
+    assert len(response.json()["results"]) == 1
+
+
+def test_provider_store_errors_never_leak_as_500(tmp_path, monkeypatch):
+    setup_service(tmp_path, monkeypatch)
+    maintenance.record_index("notes", "stub", str(tmp_path / "repo"), 1, "changed")
+    index_dir = Path(config.get_index_dir())
+    index_dir.mkdir(parents=True, exist_ok=True)
+    (index_dir / "notes.stub").write_text("{}", encoding="utf-8")
+    RecordingProvider.search_error = FileNotFoundError(
+        "/tmp/gone/notes.leann.meta.json"
+    )
+    client = TestClient(create_app())
+
+    response = client.get("/v1/search", params={"q": "x", "scope": "notes"})
+    assert response.status_code == 503
+    assert "notes.leann.meta.json" in response.json()["detail"]
+    assert RecordingProvider.search_calls[-1]["scope"] == "notes"
+    assert _log_row_count() == 0
+
+
+def test_search_results_carry_passage_metadata(tmp_path, monkeypatch):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "2000", "029")
+    assert learning.admit(str(write_draft(tmp_path, make_doc()))) == 0
+    seed_repository_scope(tmp_path)
+
+    client = TestClient(create_app())
+
+    response = client.get("/v1/search", params={"q": "index", "scope": "experience"})
+    assert response.status_code == 200
+    hit = response.json()["results"][0]
+    assert hit["path"] == "2000/029.yaml"
+    metadata = hit["metadata"]
+    assert metadata["evidence_level"] == "tests"
+    assert metadata["family"] == "2000"
+    assert metadata["run"] == "029"
+    assert metadata["repository"] == "flowrunner"
+    assert metadata["confidence"] == "high"
+    # Identity keys sit on the result itself, not twice inside metadata.
+    assert "path" not in metadata
+    assert "scope" not in metadata
+    assert "id" not in metadata
+
+    response = client.get("/v1/search", params={"q": "index", "scope": "flowrunner"})
+    assert response.status_code == 200
+    assert response.json()["results"][0]["metadata"] == {}
+
+
+def test_learning_route_lists_admitted_and_history(tmp_path, monkeypatch, capsys):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "2000", "029")
+    close_run(tmp_path, "1000", "007")
+    close_run(tmp_path, "1000", "012")
+    assert learning.admit(
+        str(write_draft(tmp_path, make_doc(), "a.yaml"))
+    ) == 0
+    assert learning.admit(
+        str(
+            write_draft(
+                tmp_path,
+                make_doc(family="1000", run="007", topic="Older one"),
+                "b.yaml",
+            )
+        )
+    ) == 0
+    assert learning.admit(
+        str(
+            write_draft(
+                tmp_path,
+                make_doc(
+                    family="1000",
+                    run="012",
+                    topic="Newest one",
+                    supersedes=["1000/007"],
+                ),
+                "c.yaml",
+            )
+        )
+    ) == 0
+
+    client = TestClient(create_app())
+
+    live = client.get("/v1/learning")
+    assert live.status_code == 200
+    artifacts = live.json()["artifacts"]
+    assert [(item["family"], item["run"]) for item in artifacts] == [
+        ("1000", "012"),
+        ("2000", "029"),
+    ]
+    assert artifacts[0]["topic"] == "Newest one"
+    assert artifacts[0]["supersedes"] == ["1000/007"]
+    assert artifacts[0]["evidence_level"] == "tests"
+    assert artifacts[0]["confidence"] == "high"
+    assert artifacts[0]["admitted_by"] == "supervisor"
+    # The route answer is exactly the pure function's answer.
+    assert artifacts == learning.list_artifact_records()
+
+    history = client.get("/v1/learning", params={"history": "true"})
+    assert history.status_code == 200
+    old = history.json()["artifacts"]
+    assert [(item["family"], item["run"]) for item in old] == [("1000", "007")]
+    assert old[0]["superseded_by"] == "1000/012"
+    assert old[0]["retracted_at"] is None
+
+    assert RecordingProvider.search_calls == []
+
+    # The CLI listing shares the records, printing byte-identical lines.
+    assert cli.main(["learning", "list"]) == 0
+    printed = capsys.readouterr().out.splitlines()
+    assert printed[0] == "1000/012\tNewest one\ttests\thigh\tsupervisor"
+    assert printed[1] == (
+        "2000/029\tShare one index directory across scopes\ttests\thigh\tsupervisor"
+    )

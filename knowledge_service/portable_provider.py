@@ -248,6 +248,13 @@ class PortableProvider(KnowledgeProvider):
         directory = Path(self._model_dir)
         return [name for name in _MODEL_FILES if not (directory / name).is_file()]
 
+    @classmethod
+    def store_exists(cls, scope: str | None = None) -> bool:
+        """Whether this scope's portable store file sits under the index dir."""
+        name = scope or config.get_scope()
+        store = Path(config.get_index_dir()) / f"{name}.portable.db"
+        return store.is_file()
+
     # ── KnowledgeProvider interface ─────────────────────────────────────
 
     def index(self, source: str) -> None:
@@ -324,7 +331,9 @@ class PortableProvider(KnowledgeProvider):
         query vector; ``filters`` entries narrow the result set by equality on
         ``scope``, ``path`` or ``model`` (a LEANN-style mapping such as
         ``{"==": value}`` is understood as the same equality). Results carry
-        ``path``, ``content``, ``score`` and ``scope``, are ordered by score,
+        ``path``, ``content``, ``score``, ``scope`` and ``metadata`` (the
+        stored extras with the identity keys removed; the empty mapping for
+        repository passages), are ordered by score,
         bounded by ``top_k`` (LEANN's default of 5 when unset) and finally cut
         to ``token_budget`` with the same rule the LEANN provider applies: the
         last included snippet is truncated to fit and nothing is padded.
@@ -345,6 +354,7 @@ class PortableProvider(KnowledgeProvider):
                     "content": row["content"],
                     "score": float(_cosine(query_vector, vector)),
                     "scope": row["scope"],
+                    "metadata": _metadata_for_result(row),
                 }
             )
         scored.sort(key=lambda item: (-item["score"], str(item["path"])))
@@ -454,8 +464,7 @@ class PortableProvider(KnowledgeProvider):
     def _matches_filters(row: sqlite3.Row, filters: dict[str, Any] | None) -> bool:
         """Whether a stored row satisfies every equality filter.
 
-        Column fields (``scope``, ``path``, ``model``) are compared directly.
-        Any other field comes from the JSON in the row's ``metadata`` column;
+        Column fields (``scope``, ``path``, ``model``) are compared directly.        Any other field comes from the JSON in the row's ``metadata`` column;
         a row without that metadata fails the filter, matching how the LEANN
         filter engine treats missing fields. Entries that are scalars, or
         mappings of ``{"==": value}``, compare equality; entries that are
@@ -549,6 +558,28 @@ def _decode_vector(blob: Any) -> list[float]:
         blob = blob.tobytes()
     count = len(blob) // 4
     return list(struct.unpack(f"<{count}f", blob))
+
+
+def _metadata_for_result(row: Any) -> dict[str, Any]:
+    """Return one row's stored passage metadata, minus the identity keys.
+
+    The JSON column holds what the manifest carried (for learning scopes the
+    evidence level, repository, family, run, confidence — plus ``origin``
+    for ecosystem and ``superseded_by``/``retracted_at`` for history). The
+    identity keys ``id``, ``path`` and ``scope`` are already result fields,
+    so they are not repeated inside ``metadata``; repository passages carry
+    nothing else and therefore answer with the empty mapping.
+    """
+    raw = row["metadata"] if "metadata" in row.keys() else None
+    if not isinstance(raw, str) or not raw:
+        return {}
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    return {key: value for key, value in loaded.items() if key not in {"id", "path", "scope"}}
 
 
 def _cosine(first: list[float], second: list[float]) -> float:

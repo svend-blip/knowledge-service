@@ -89,6 +89,10 @@ class StubProvider:
     def remove(self, source: str) -> None:
         StubProvider.calls.append(f"remove:{source}")
 
+    @classmethod
+    def store_exists(cls, scope=None) -> bool:
+        return True
+
     def search(self, query, *, scope=None, filters=None, top_k=None, token_budget=None):
         StubProvider.calls.append(f"search:{query}")
         if StubProvider.search_error is not None:
@@ -191,6 +195,8 @@ def test_search_route_denied_is_403_with_detail(tmp_path, monkeypatch):
     install_stub(monkeypatch)
     stub_torch(monkeypatch)
     write_ini(tmp_path, monkeypatch, service_ini(tmp_path, monkeypatch))
+    maintenance.record_index("flowrunner", "stub", str(tmp_path / "index_dir"), 1, "changed")
+    maintenance.record_index("dpmtf-webui", "stub", str(tmp_path / "index_dir"), 1, "changed")
     client = make_client()
 
     response = client.get(
@@ -220,6 +226,7 @@ def test_search_route_not_ready_is_503(tmp_path, monkeypatch):
     stub_torch(monkeypatch)
     StubProvider.preflight_error = ProviderNotReady("no CUDA device is available")
     write_ini(tmp_path, monkeypatch, service_ini(tmp_path, monkeypatch))
+    maintenance.record_index("flowrunner", "stub", str(tmp_path / "index_dir"), 1, "changed")
     client = make_client()
 
     response = client.get("/v1/search", params={"q": "x", "scope": "flowrunner"})
@@ -238,6 +245,7 @@ def test_search_route_writes_one_log_row(tmp_path, monkeypatch):
         {"path": "docs/a.md", "content": "two words", "score": 0.8},
     ]
     write_ini(tmp_path, monkeypatch, service_ini(tmp_path, monkeypatch))
+    maintenance.record_index("flowrunner", "stub", str(tmp_path / "index_dir"), 2, "changed")
     client = make_client()
 
     response = client.get(
@@ -414,13 +422,17 @@ def test_token_header_guards_every_route_except_health(tmp_path, monkeypatch):
     ).status_code == 403
 
     allowed = {"X-Knowledge-Token": "sekret"}
+    maintenance.record_index(
+        "dpmtf-webui", "stub", str(tmp_path / "index_dir"), 1, "changed"
+    )
     search_response = client.get("/v1/search", headers=allowed, params={"q": "x"})
     assert search_response.status_code == 200
     assert search_response.json()["enabled"] is True
 
     scopes_response = client.get("/v1/scopes", headers=allowed)
     assert scopes_response.status_code == 200
-    assert scopes_response.json() == []
+    scopes = scopes_response.json()
+    assert [row["scope"] for row in scopes] == ["dpmtf-webui"]
 
     slug = client.get(
         "/v1/scope-for-path", headers=allowed, params={"path": "/srv/FlowRunner/"}
@@ -742,6 +754,7 @@ def test_search_route_records_the_flow_key(tmp_path, monkeypatch):
     install_stub(monkeypatch)
     stub_torch(monkeypatch)
     write_ini(tmp_path, monkeypatch, service_ini(tmp_path, monkeypatch))
+    maintenance.record_index("flowrunner", "stub", str(tmp_path / "index_dir"), 1, "changed")
     client = make_client()
 
     response = client.get(
@@ -1070,7 +1083,7 @@ def test_portable_index_search_roundtrip_with_fake_embedder(tmp_path, monkeypatc
     assert results[1]["score"] == 0.0
     assert results[0]["content"] == "apple pie"
     assert results[0]["scope"] == "s"
-    assert set(results[0]) == {"path", "content", "score", "scope"}
+    assert set(results[0]) == {"path", "content", "score", "scope", "metadata"}
 
     # Embeddings go in as float32 blobs with their width and model id.
     conn = sqlite3.connect(tmp_path / "store" / "s.portable.db")
@@ -1085,6 +1098,52 @@ def test_portable_index_search_roundtrip_with_fake_embedder(tmp_path, monkeypatc
 
     # One batched call per index, then a single call for the query.
     assert embedder.calls == [["apple pie", "banana split"], ["apple"]]
+
+
+def test_portable_provider_results_carry_metadata(tmp_path, monkeypatch):
+    portable_ini(tmp_path, monkeypatch)
+    provider = portable_provider(tmp_path)
+    manifest = write_manifest(
+        tmp_path,
+        [
+            {
+                "scope": "s",
+                "path": "docs/a.md",
+                "content": "apple pie",
+                "metadata": {
+                    "scope": "s",
+                    "path": "docs/a.md",
+                    "evidence_level": "tests",
+                    "family": "2000",
+                    "run": "029",
+                    "confidence": "high",
+                    "origin": "flowrunner",
+                },
+            },
+            {
+                "scope": "s",
+                "path": "docs/b.md",
+                "content": "banana split",
+                "metadata": {"scope": "s", "path": "docs/b.md"},
+            },
+        ],
+    )
+
+    assert provider.index(manifest) is None
+
+    results = provider.search("apple", scope="s")
+    first = results[0]["metadata"]
+    assert first["evidence_level"] == "tests"
+    assert first["family"] == "2000"
+    assert first["run"] == "029"
+    assert first["confidence"] == "high"
+    assert first["origin"] == "flowrunner"
+    # Identity keys are not repeated inside metadata.
+    assert "path" not in first
+    assert "scope" not in first
+    assert "id" not in first
+    # A passage whose stored metadata is identity-only answers empty.
+    assert results[1]["metadata"] == {}
 
 
 def test_portable_update_replaces_and_remove_deletes(tmp_path, monkeypatch):

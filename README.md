@@ -21,16 +21,35 @@ Base path `/v1`. When `[service] token` is set, every route except
 | GET | `/v1/search` | `q`, `scope`, `top_k`, `token_budget`, `agent_role`, `flow_key`, `run_id`, `handoff_id` | Search one scope, record the retrieval |
 | POST | `/v1/refresh` | body `{"scope": ..., "repo_path": ...}` | Re-index a scope when its repository changed |
 | GET | `/v1/scopes` | — | List registered scopes with document counts |
+| GET | `/v1/learning` | `history` | List admitted learning artifacts (`history=true` for the older ones) |
 | GET | `/v1/scope-for-path` | `path` | Resolve a repository path to its scope slug |
 | GET | `/v1/health` | — | Provider, enabled flag, preflight result |
 
-Status codes: `200` with the stable envelope `{"enabled", "provider",
-"results", "bounded"}` when searching is on or disabled; `403` with
-`{"detail": ...}` when the scope guard denies the caller's scope; `503` with
-`{"detail": ...}` when the provider is not ready (no free GPU yet); `400` on
-bad input (`repo_path` is not a directory, empty scope, manifest inside the
-repository). `top_k` and `token_budget` fall back to the configured values
-and are clamped to them: a caller may lower them, never raise them.
+Status codes on `/v1/search`, in order: `403` with `{"detail": ...}` when
+the scope guard denies the caller's scope; `404` with `{"detail": ...}` on a
+scope the registry does not know; `503` with `{"detail": ...}` when the
+scope's store files are absent under the index dir or the provider is not
+ready (no free GPU yet); `503` again when the provider's search raises an
+`OSError`, with the exception text as detail — a store error never surfaces
+as a 500. The three learning scopes keep their empty-history answer of
+`200` with an empty result list and take precedence over the 404/503 path;
+error answers write no retrieval-log row. Disabled installations still get
+the `200` envelope `{"enabled", "provider", "results", "bounded"}`;
+`400` covers bad input (`repo_path` is not a directory, empty scope,
+manifest inside the repository). `top_k` and `token_budget` fall back to
+the configured values and are clamped to them: a caller may lower them,
+never raise them.
+
+Every search result carries `path`, `content`, `score`, `scope` and
+`metadata` — the passage's stored extras with the identity keys removed:
+`{}` for repository passages; for learning passages `evidence_level`,
+`repository`, `family`, `run` and `confidence`, plus `origin` for ecosystem
+passages and `superseded_by`/`retracted_at` on history ones when present.
+`GET /v1/learning` lists admitted artifacts read-only — one object per
+artifact with `family`, `run`, `topic`, `evidence_level`, `confidence`,
+`admitted_by` and `supersedes`, sorted by family then run — without the
+scope guard; `history=true` lists the superseded and retracted ones with
+their two extra fields.
 
 ## Configuration
 
