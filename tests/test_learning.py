@@ -822,3 +822,237 @@ def test_learning_route_lists_admitted_and_history(tmp_path, monkeypatch, capsys
     assert printed[1] == (
         "2000/029\tShare one index directory across scopes\ttests\thigh\tsupervisor"
     )
+
+
+# ── A2-3: admission from the run directory, pending drafts ──────────────
+
+
+def write_run_draft(tmp_path: Path, family: str, run: str, doc: dict) -> Path:
+    """Write ``doc`` to ``<runs_root>/<family>/runs/<run>/LEARNING-DRAFT.yaml``."""
+    path = learning.draft_path(family, run)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+    return path
+
+
+def ledger_lines() -> list:
+    ledger = learning.learning_dir() / "LEDGER.md"
+    if not ledger.is_file():
+        return []
+    return [
+        line
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+        if line.startswith("- ")
+    ]
+
+
+def test_admit_run_reads_the_draft_from_the_runs_root_and_sets_admitted_by(
+    tmp_path, monkeypatch
+):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "2000", "041")
+    draft = write_run_draft(
+        tmp_path, "2000", "041", make_doc(run="041", admitted_by="pending")
+    )
+    before = draft.read_bytes()
+
+    assert learning.draft_path("2000", "041") == draft
+    assert learning.admit_run("2000/041", "svend") == 0
+
+    artifact = yaml.safe_load(
+        (learning.learning_dir() / "2000" / "041.yaml").read_text(encoding="utf-8")
+    )
+    assert artifact["admitted_by"] == "svend"
+    assert artifact["topic"] == "Share one index directory across scopes"
+
+    # The draft keeps its bytes and its place; only the artifact carries the name.
+    assert draft.read_bytes() == before
+    assert draft.is_file()
+
+    lines = ledger_lines()
+    assert len(lines) == 1
+    assert "| admitted | 2000/041 | tests | svend |" in lines[0]
+    assert lines[0].endswith(f"| source={draft}")
+
+
+def test_admit_run_refuses_pending_missing_and_unclosed(tmp_path, monkeypatch):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "2000", "041")
+    write_run_draft(
+        tmp_path, "2000", "041", make_doc(run="041", admitted_by="pending")
+    )
+    directory = learning.learning_dir()
+
+    assert learning.admit_run("2000/041", "pending") == 1
+    assert learning.admit_run("2000/041", "Pending") == 1
+    assert learning.admit_run("2000/041", "   ") == 1
+    assert learning.admit_run("no-slash", "svend") == 1
+    assert learning.admit_run("1000/007", "svend") == 1  # no draft there
+    assert not directory.joinpath("2000", "041.yaml").is_file()
+    assert ledger_lines() == []
+
+    close_run(tmp_path, "2000", "041", status="BLOCKED")
+    assert learning.admit_run("2000/041", "svend") == 1
+    assert not directory.joinpath("2000", "041.yaml").is_file()
+    assert ledger_lines() == []
+
+
+def test_validate_run_reports_violations_and_run_status_without_admitting(
+    tmp_path, monkeypatch, capsys
+):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "2000", "041")
+    write_run_draft(
+        tmp_path,
+        "2000",
+        "041",
+        make_doc(run="041", admitted_by="pending", confidence="very-high"),
+    )
+
+    assert learning.validate_run("2000/041") == 1
+    printed = capsys.readouterr().out.splitlines()
+    assert any("confidence" in line for line in printed)
+    assert "run status: SUCCESS" in printed
+
+    directory = learning.learning_dir()
+    assert not directory.joinpath("2000", "041.yaml").is_file()
+    assert ledger_lines() == []
+
+    write_run_draft(tmp_path, "2000", "041", make_doc(run="041"))
+    assert learning.validate_run("2000/041") == 0
+    assert capsys.readouterr().out.splitlines() == ["run status: SUCCESS"]
+
+    # Markdown decoration and a trailing note still read as the bare word.
+    report = tmp_path / "flows" / "2000" / "runs" / "041" / "END-REPORT.md"
+    report.write_text(
+        "# END-REPORT\n**Status: SUCCESS** — run closed.\n", encoding="utf-8"
+    )
+    assert learning.validate_run("2000/041") == 0
+    assert capsys.readouterr().out.splitlines() == ["run status: SUCCESS"]
+
+    close_run(tmp_path, "1000", "007", status="BLOCKED")
+    write_run_draft(tmp_path, "1000", "007", make_doc(family="1000", run="007"))
+    assert learning.validate_run("1000/007") == 0
+    assert capsys.readouterr().out.splitlines() == ["run status: BLOCKED"]
+
+    # No END-REPORT reads as missing; a missing draft is a clean refusal.
+    write_run_draft(tmp_path, "3000", "001", make_doc(family="3000", run="001"))
+    assert learning.validate_run("3000/001") == 0
+    assert capsys.readouterr().out.splitlines() == ["run status: missing"]
+    assert learning.validate_run("4000/002") == 1
+
+
+def test_drafts_route_lists_pending_drafts_with_run_status(tmp_path, monkeypatch):
+    setup_service(tmp_path, monkeypatch)
+    assert learning.list_pending_drafts() == []
+
+    close_run(tmp_path, "1000", "007")
+    close_run(tmp_path, "1000", "012")
+    close_run(tmp_path, "2000", "041")
+    write_run_draft(
+        tmp_path,
+        "1000",
+        "007",
+        make_doc(family="1000", run="007", topic="Older one", admitted_by="pending"),
+    )
+    write_run_draft(
+        tmp_path,
+        "1000",
+        "012",
+        make_doc(family="1000", run="012", topic="Newest one", admitted_by="pending"),
+    )
+    broken = learning.draft_path("2000", "041")
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    broken.write_text("topic: [unclosed\n", encoding="utf-8")
+
+    assert learning.admit_run("1000/012", "svend") == 0
+
+    client = TestClient(create_app())
+
+    response = client.get("/v1/learning/drafts")
+    assert response.status_code == 200
+    items = response.json()["drafts"]
+    assert items == learning.list_pending_drafts()
+    assert [(item["family"], item["run"]) for item in items] == [
+        ("1000", "007"),
+        ("1000", "012"),
+        ("2000", "041"),
+    ]
+    assert items[0]["topic"] == "Older one"
+    assert items[0]["evidence_level"] == "tests"
+    assert items[0]["run_status"] == "SUCCESS"
+    assert items[0]["valid"] is True
+    assert items[0]["violations"] == 0
+    assert items[0]["admitted"] is False
+    assert items[1]["admitted"] is True
+
+    pending = client.get("/v1/learning/drafts", params={"pending": "true"})
+    assert pending.status_code == 200
+    kept = pending.json()["drafts"]
+    assert [(item["family"], item["run"]) for item in kept] == [
+        ("1000", "007"),
+        ("2000", "041"),
+    ]
+
+    broken_entry = items[2]
+    assert broken_entry["valid"] is False
+    assert broken_entry["violations"] == 1
+    assert broken_entry["topic"] == ""
+    assert broken_entry["run_status"] == "SUCCESS"
+
+    assert RecordingProvider.search_calls == []
+
+
+def test_cli_learning_admit_run_and_drafts(tmp_path, monkeypatch, capsys):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "1000", "007")
+    close_run(tmp_path, "2000", "041")
+    write_run_draft(
+        tmp_path,
+        "1000",
+        "007",
+        make_doc(family="1000", run="007", topic="Older one", admitted_by="pending"),
+    )
+    write_run_draft(
+        tmp_path, "2000", "041", make_doc(run="041", admitted_by="pending")
+    )
+
+    assert cli.main(["learning", "drafts"]) == 0
+    printed = capsys.readouterr().out.splitlines()
+    assert len(printed) == 2
+    assert printed[0] == "1000/007\tOlder one\ttests\tSUCCESS\tpending\tvalid\t0"
+    assert printed[1].startswith("2000/041\tShare one index directory")
+    assert printed[1].endswith("\tSUCCESS\tpending\tvalid\t0")
+
+    assert cli.main(["learning", "validate-run", "2000/041"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["run status: SUCCESS"]
+
+    assert (
+        cli.main(
+            ["learning", "admit-run", "2000/041", "--admitted-by", "svend"]
+        )
+        == 0
+    )
+    artifact = learning.learning_dir() / "2000" / "041.yaml"
+    assert artifact.is_file()
+    doc = yaml.safe_load(artifact.read_text(encoding="utf-8"))
+    assert doc["admitted_by"] == "svend"
+    assert ledger_lines()[-1].endswith(
+        f"| source={learning.draft_path('2000', '041')}"
+    )
+
+    # The CLI writes exactly where the function writes, through the same path.
+    assert learning.learning_dir().joinpath("1000", "007.yaml") == learning._artifact_path(
+        "1000", "007"
+    )
+    assert learning.admit_run("1000/007", "reviewer") == 0
+    assert learning.learning_dir().joinpath("1000", "007.yaml").is_file()
+
+    assert cli.main(["learning", "drafts"]) == 0
+    printed = capsys.readouterr().out.splitlines()
+    assert [line.split("\t")[0] for line in printed] == ["1000/007", "2000/041"]
+    assert all("\tadmitted\tvalid\t0" in line for line in printed)
+
+    assert cli.main(["learning", "admit-run", "no-slash", "--admitted-by", "x"]) == 1

@@ -3,7 +3,8 @@
 Invoked as ``python -m knowledge_service.cli <command>``. Commands:
 ``serve``, ``refresh``, ``refresh-all``, ``scopes``, ``grant``, ``revoke``,
 ``import-registry``, ``download-model``, ``learning`` (with subcommands
-``validate``, ``admit``, ``retract``, ``list``, ``rebuild``). Errors are one
+``validate``, ``validate-run``, ``admit``, ``admit-run``, ``drafts``,
+``retract``, ``list``, ``rebuild``). Errors are one
 clear line on stderr and exit code 1 — never a traceback.
 """
 
@@ -395,8 +396,14 @@ def _cmd_learning(args: argparse.Namespace) -> int:
     try:
         if command == "validate":
             return knowledge_learning.validate_file(args.yaml_path)
+        if command == "validate-run":
+            return knowledge_learning.validate_run(args.ref)
         if command == "admit":
             return knowledge_learning.admit(args.yaml_path)
+        if command == "admit-run":
+            return knowledge_learning.admit_run(args.ref, args.admitted_by)
+        if command == "drafts":
+            return knowledge_learning.print_drafts()
         if command == "retract":
             return knowledge_learning.retract(args.ref)
         if command == "list":
@@ -462,6 +469,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     learning_admit.add_argument("yaml_path")
     learning_admit.set_defaults(handler=_cmd_learning)
+    learning_admit_run = learning_sub.add_parser(
+        "admit-run", help="admit one closed run's LEARNING-DRAFT in place"
+    )
+    learning_admit_run.add_argument("ref", help="family/run, e.g. 2000/041")
+    learning_admit_run.add_argument(
+        "--admitted-by", default="", help="name of the admitting supervisor"
+    )
+    learning_admit_run.set_defaults(handler=_cmd_learning)
+    learning_validate_run = learning_sub.add_parser(
+        "validate-run", help="list one run draft's violations and its run status"
+    )
+    learning_validate_run.add_argument("ref", help="family/run, e.g. 2000/041")
+    learning_validate_run.set_defaults(handler=_cmd_learning)
+    learning_drafts = learning_sub.add_parser(
+        "drafts", help="list the run-directory drafts awaiting admission"
+    )
+    learning_drafts.set_defaults(handler=_cmd_learning)
     learning_retract = learning_sub.add_parser(
         "retract", help="move one admitted artifact to history"
     )

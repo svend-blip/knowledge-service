@@ -40,11 +40,17 @@ __all__ = [
     "validate",
     "levels_at_least",
     "learning_dir",
+    "draft_path",
     "validate_file",
+    "validate_run",
     "admit",
+    "admit_document",
+    "admit_run",
     "retract",
     "list_artifact_records",
     "list_artifacts",
+    "list_pending_drafts",
+    "print_drafts",
     "rebuild",
     "build_manifests",
 ]
@@ -194,6 +200,17 @@ def learning_dir() -> Path:
     return Path(config.get_learning_dir()).expanduser()
 
 
+def draft_path(family: str, run: str) -> Path:
+    """The decomposer's draft file for one run, inside its run directory.
+
+    ``<runs_root>/<family>/runs/<run>/LEARNING-DRAFT.yaml``, written by the
+    chain at SUCCESS closure with ``admitted_by: pending`` and never moved by
+    this service.
+    """
+    runs_root = Path(config.get_learning_runs_root()).expanduser()
+    return runs_root / str(family) / "runs" / str(run) / "LEARNING-DRAFT.yaml"
+
+
 def _artifact_path(family: str, run: str) -> Path:
     return learning_dir() / str(family) / f"{run}.yaml"
 
@@ -308,8 +325,39 @@ def _check_run_closed(family: str, run: str) -> str:
     return ""
 
 
-def _ledger_line(action: str, family: str, run: str, doc: dict) -> None:
-    """Append one ledger line: stamp, action, family/run, level, admitted_by."""
+def _status_word(status_line: str) -> str:
+    """The bare status word of one cleaned ``Status`` line.
+
+    ``**Status:** SUCCESS`` and ``**Status: SUCCESS** — run closed.`` both
+    yield ``SUCCESS``: everything after a spaced dash is a trailing note, and
+    the Markdown decoration around the word is stripped.
+    """
+    value = status_line.partition(":")[2]
+    for separator in (" — ", " – ", " - ", "\t"):
+        value = value.split(separator)[0]
+    value = value.strip().strip("*_`").strip()
+    return value or "missing"
+
+
+def _run_status(family: str, run: str) -> str:
+    """The word from the run's first ``Status`` line, else ``missing``."""
+    report = draft_path(family, run).parent / "END-REPORT.md"
+    if not report.is_file():
+        return "missing"
+    try:
+        text = report.read_text(encoding="utf-8")
+    except OSError as exc:
+        _warn(f"cannot read {report}: {exc}")
+        return "missing"
+    for line in text.splitlines():
+        cleaned = line.lstrip("*_`#>- \t")
+        if cleaned.startswith("Status"):
+            return _status_word(cleaned)
+    return "missing"
+
+
+def _ledger_line(action: str, family: str, run: str, doc: dict, source: str = "") -> None:
+    """Append one ledger line: stamp, action, family/run, level, admitted_by, source."""
     validation = doc.get("validation") or {}
     level = validation.get("evidence_level", "") if isinstance(validation, dict) else ""
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -321,7 +369,7 @@ def _ledger_line(action: str, family: str, run: str, doc: dict) -> None:
             handle.write("# Learning Ledger\n\n")
         handle.write(
             f"- {stamp} | {action} | {family}/{run} | {level} | "
-            f"{doc.get('admitted_by', '')}\n"
+            f"{doc.get('admitted_by', '')} | source={source}\n"
         )
 
 
@@ -356,7 +404,18 @@ def admit(path: str) -> int:
     doc, message = _load_yaml(source)
     if doc is None:
         return _fail(message)
+    return admit_document(doc, str(source))
 
+
+def admit_document(doc: dict, source: str) -> int:
+    """Run the whole admission on one loaded document; ``source`` is the origin.
+
+    The document-level half of admission, shared by ``admit`` (which loads a
+    given file) and ``admit_run`` (which loads a run's draft in place):
+    validate, prove the run closed SUCCESS, apply ``supersedes``, write the
+    artifact, append one ledger line carrying ``source``, rebuild. The source
+    document itself is never modified or moved.
+    """
     violations = validate(doc)
     if violations:
         for violation in violations:
@@ -378,8 +437,71 @@ def admit(path: str) -> int:
         _move_to_history(older_family, older_run, {"superseded_by": f"{family}/{run}"})
 
     _dump_yaml(_artifact_path(family, run), dict(doc))
-    _ledger_line("admitted", family, run, doc)
+    _ledger_line("admitted", family, run, doc, source)
     return rebuild()
+
+
+def admit_run(ref: str, admitted_by: str) -> int:
+    """Admit the draft of one closed run in place; return the exit code.
+
+    ``ref`` is ``"<family>/<run>"``; the draft is read from the run directory
+    (``draft_path``), its ``admitted_by`` is replaced with the admitter's
+    name, and exactly the document-level admission path runs on it. Refusals
+    (exit 1, clean message): a malformed ref, a missing draft, an empty
+    ``admitted_by``, the value ``pending`` in any casing, plus everything
+    ``admit_document`` refuses. The draft file itself is never touched.
+    """
+    parts = _split_ref(ref)
+    if parts is None:
+        return _fail(f"reference must be \"family/run\", got {ref!r}")
+    family, run = parts
+
+    artifact = draft_path(family, run)
+    if not artifact.is_file():
+        return _fail(f"no draft for {family}/{run}: {artifact} does not exist")
+
+    name = (admitted_by or "").strip()
+    if not name:
+        return _fail("--admitted-by must name the admitter and cannot be empty")
+    if name.lower() == "pending":
+        return _fail(
+            "--admitted-by must name the admitter, not the placeholder "
+            "\"pending\"; pass the supervisor's name"
+        )
+
+    doc, message = _load_yaml(artifact)
+    if doc is None:
+        return _fail(message)
+    doc = dict(doc)
+    doc["admitted_by"] = name
+    return admit_document(doc, str(artifact))
+
+
+def validate_run(ref: str) -> int:
+    """Print one run's draft violations and its run status; never admits.
+
+    Violations print exactly as ``validate_file`` prints them, then one line
+    ``run status: <SUCCESS|BLOCKED|…|missing>`` from the END-REPORT's first
+    ``Status`` line (Markdown stripped, ``missing`` when there is none). Exit
+    code follows the violations.
+    """
+    parts = _split_ref(ref)
+    if parts is None:
+        return _fail(f"reference must be \"family/run\", got {ref!r}")
+    family, run = parts
+
+    artifact = draft_path(family, run)
+    if not artifact.is_file():
+        return _fail(f"no draft for {family}/{run}: {artifact} does not exist")
+    doc, message = _load_yaml(artifact)
+    if doc is None:
+        return _fail(message)
+
+    violations = validate(doc)
+    for violation in violations:
+        print(violation)
+    print(f"run status: {_run_status(family, run)}")
+    return 0 if not violations else 1
 
 
 def retract(ref: str) -> int:
@@ -402,7 +524,7 @@ def retract(ref: str) -> int:
 
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     _move_to_history(family, run, {"retracted_at": stamp})
-    _ledger_line("retracted", family, run, doc)
+    _ledger_line("retracted", family, run, doc, str(source))
     return rebuild()
 
 
@@ -455,6 +577,78 @@ def list_artifacts() -> int:
             f"{record['family']}/{record['run']}\t{record['topic']}\t"
             f"{record['evidence_level']}\t{record['confidence']}\t"
             f"{record['admitted_by']}"
+        )
+    return 0
+
+
+def list_pending_drafts() -> list[dict]:
+    """Return one plain dict per run-directory draft, newest listing first.
+
+    Scans ``<runs_root>/*/runs/*/LEARNING-DRAFT.yaml``; every record carries
+    ``family``, ``run``, ``topic``, ``evidence_level``, ``run_status`` (the
+    word from the run's END-REPORT, ``missing`` when there is none),
+    ``admitted`` (an artifact for that ``family/run`` exists under the
+    learning directory or its history), ``valid`` and ``violations`` (the
+    number of schema violations). Sorted by ``family``, then ``run``. A draft
+    that does not parse is listed with ``valid`` false, one violation and an
+    empty topic. A missing runs root is an empty list. Pure read: nothing is
+    written or rebuilt.
+    """
+    runs_root = Path(config.get_learning_runs_root()).expanduser()
+    if not runs_root.is_dir():
+        return []
+
+    drafts: list[dict] = []
+    for artifact in runs_root.glob("*/runs/*/LEARNING-DRAFT.yaml"):
+        parts = artifact.relative_to(runs_root).parts
+        family, run = str(parts[0]), str(parts[2])
+        record: dict = {
+            "family": family,
+            "run": run,
+            "topic": "",
+            "evidence_level": "",
+            "run_status": _run_status(family, run),
+            "admitted": (
+                _artifact_path(family, run).is_file()
+                or _history_path(family, run).is_file()
+            ),
+        }
+        doc, message = _load_yaml(artifact)
+        if doc is None:
+            _warn(message)
+            record.update({"topic": "", "valid": False, "violations": 1})
+            drafts.append(record)
+            continue
+        violations = validate(doc)
+        validation = doc.get("validation") or {}
+        level = (
+            validation.get("evidence_level", "")
+            if isinstance(validation, dict)
+            else ""
+        )
+        record.update(
+            {
+                "topic": str(doc.get("topic", "")),
+                "evidence_level": str(level),
+                "valid": not violations,
+                "violations": len(violations),
+            }
+        )
+        drafts.append(record)
+
+    drafts.sort(key=lambda item: (item["family"], item["run"]))
+    return drafts
+
+
+def print_drafts() -> int:
+    """Print one tab-separated line per draft awaiting or holding admission."""
+    for record in list_pending_drafts():
+        print(
+            f"{record['family']}/{record['run']}\t{record['topic']}\t"
+            f"{record['evidence_level']}\t{record['run_status']}\t"
+            f"{'admitted' if record['admitted'] else 'pending'}\t"
+            f"{'valid' if record['valid'] else 'invalid'}\t"
+            f"{record['violations']}"
         )
     return 0
 

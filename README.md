@@ -311,6 +311,11 @@ python -m knowledge_service.cli learning validate draft.yaml
 # admit a closed SUCCESS run: writes the artifact, applies supersedes,
 # rebuilds both scopes and their manifests
 python -m knowledge_service.cli learning admit draft.yaml
+# the same admission straight from the run directory, naming the admitter
+python -m knowledge_service.cli learning admit-run 2000/041 --admitted-by svend
+# one run draft's violations plus its END-REPORT status, without admitting
+python -m knowledge_service.cli learning validate-run 2000/041
+python -m knowledge_service.cli learning drafts
 python -m knowledge_service.cli learning retract 2000/029
 python -m knowledge_service.cli learning list
 python -m knowledge_service.cli learning rebuild
@@ -332,6 +337,24 @@ scopes (their registry rows carry the learning directory as location); they
 are rebuilt by `learning rebuild` in seconds. An empty manifest leaves no
 store behind, and searching an emptied learning scope answers with an empty
 result list instead of reaching the provider.
+
+The supervisor admits with
+`learning admit-run <family>/<run> --admitted-by <name>`: the draft is read
+from `<runs_root>/<family>/runs/<run>/LEARNING-DRAFT.yaml`, its
+`admitted_by` is replaced with the name (the placeholder `pending` itself is
+refused, as is an empty name), and exactly the `learning admit` path runs on
+that document — the draft file itself is never modified or moved.
+`learning validate-run <family>/<run>` prints the same draft's violations
+plus one `run status: <SUCCESS|BLOCKED|…|missing>` line from the END-REPORT's
+first `Status` line (`missing` when there is none) and never admits.
+`learning drafts` lists every run-directory draft, one tab-separated line
+each (`family/run`, topic, evidence level, run status, admitted/pending,
+valid/invalid, violation count, sorted by family then run), and
+`GET /v1/learning/drafts` answers that list as `{"drafts": [...]}` — read-only,
+no scope guard, like `/v1/learning`; `?pending=true` keeps only the drafts
+whose artifact is not admitted yet. Every ledger line carries a sixth column
+`source=<path>` naming where the admitted artifact came from: the draft path
+for `admit-run`, the given file path for `admit`.
 
 The two config keys are `[learning] dir` (default `<index_dir>/learning`)
 and `[learning] runs_root`. See `knowledge.ini.example`.

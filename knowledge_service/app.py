@@ -503,6 +503,22 @@ def create_app():
         """
         return {"artifacts": learning.list_artifact_records(history)}
 
+    @application.get("/v1/learning/drafts")
+    async def learning_drafts_route(
+        pending: bool = False,
+        _token: None = Depends(require_token),
+    ) -> dict:
+        """List the run-directory drafts; ``pending=true`` keeps unadmitted ones.
+
+        Read-only, no scope guard: the listing mirrors ``learning drafts``, so
+        a supervisor can see what waits for admission before calling
+        ``learning admit-run``.
+        """
+        drafts = learning.list_pending_drafts()
+        if pending:
+            drafts = [item for item in drafts if not item["admitted"]]
+        return {"drafts": drafts}
+
     @application.get("/v1/scope-for-path")
     async def scope_for_path_route(
         path: str = "",
