@@ -56,6 +56,9 @@ __all__ = [
     "record_index",
     "probe_provider_capabilities",
     "refresh_scope",
+    "refresh_manifest_scope",
+    "is_learning_location",
+    "learning_store_present",
     "main",
 ]
 
@@ -299,6 +302,121 @@ def refresh_scope(scope: str, repo_path: str) -> dict:
         "documents": document_count,
         "manifest": str(manifest_path),
     }
+
+
+def is_learning_location(location) -> bool:
+    """Whether a registry ``location`` sits under the learning directory.
+
+    The three learning scopes (experience, ecosystem, experience-history)
+    record the learning directory as their location; repository scopes
+    record their repository path. This is how ``refresh-all`` tells them
+    apart and skips the manifest-driven ones without a second config lookup
+    per row.
+    """
+    if not location:
+        return False
+    base = Path(config.get_learning_dir()).expanduser()
+    try:
+        loc = Path(str(location)).expanduser().resolve()
+        base = base.resolve()
+    except OSError:
+        return False
+    return loc == base or base in loc.parents
+
+
+def refresh_manifest_scope(scope: str, manifest_path: str) -> dict:
+    """Rebuild one non-repository scope straight from its JSONL manifest.
+
+    Order is the contract: count the manifest's records first, because an
+    empty manifest must never reach the provider (LEANN refuses a zero-record
+    store with ``No chunks added.``). Empty path: remove whatever store files
+    earlier builds left for this scope under the index dir, record one
+    ``knowledge_indexes`` row with ``document_count = 0`` and status
+    ``empty``, and return without any provider call. Non-empty path: resolve
+    the configured provider for the scope, preflight it, ``provider.index``
+    the manifest, and record one ``knowledge_indexes`` row whose ``location``
+    is the learning directory and whose ``status`` is ``changed``. There is
+    no repository scan and no change detection: the manifest is the store's
+    source of truth and a rebuild takes seconds. Used for ``experience``,
+    ``ecosystem`` and ``experience-history``; ``refresh-all`` skips these
+    scopes through :func:`is_learning_location`.
+    """
+    manifest = Path(manifest_path).expanduser()
+    if not manifest.is_file():
+        _fail(f"manifest does not exist: {manifest}")
+
+    with manifest.open("r", encoding="utf-8") as handle:
+        document_count = sum(1 for line in handle if line.strip())
+
+    index_dir = Path(config.get_index_dir())
+    learning_location = str(Path(config.get_learning_dir()).expanduser())
+
+    if document_count == 0:
+        # Zero records: drop the old store (it would otherwise keep serving
+        # retracted passages) and record the empty state. No provider call.
+        _remove_scope_store(index_dir, scope)
+        record_index(
+            scope, config.get_provider(), learning_location, 0, "empty"
+        )
+        return {
+            "status": "empty",
+            "documents": 0,
+            "manifest": str(manifest),
+        }
+
+    provider_key = config.get_provider()
+    provider_cls = search.resolve_provider(provider_key, scope=scope)
+    provider = provider_cls()
+
+    provider.preflight()
+
+    provider.index(str(manifest))
+
+    record_index(
+        scope,
+        provider_key,
+        learning_location,
+        document_count,
+        "changed",
+    )
+
+    return {
+        "status": "changed",
+        "documents": document_count,
+        "manifest": str(manifest),
+    }
+
+
+def _scope_store_files(index_dir: Path, scope: str) -> list[Path]:
+    """Store files ``index_dir`` holds for ``scope`` (the manifest excluded).
+
+    Both providers name the store after the scope: LEANN writes
+    ``<scope>.leann`` plus ``<scope>.leann.meta.json``, portable writes
+    ``<scope>.portable.db``; a test stub may write its own ``.<something>``
+    marker. The JSONL manifest itself is the source, not a store file.
+    """
+    try:
+        candidates = sorted(index_dir.glob(f"{scope}.*"))
+    except OSError:
+        return []
+    return [path for path in candidates if path.name != f"{scope}.jsonl"]
+
+
+def _remove_scope_store(index_dir: Path, scope: str) -> None:
+    """Delete whatever ``provider.index`` previously wrote for one scope."""
+    for candidate in _scope_store_files(index_dir, scope):
+        try:
+            if candidate.is_dir():
+                shutil.rmtree(candidate, ignore_errors=True)
+            else:
+                candidate.unlink()
+        except OSError:
+            pass
+
+
+def learning_store_present(scope: str) -> bool:
+    """Whether the index dir holds any store file for ``scope``."""
+    return bool(_scope_store_files(Path(config.get_index_dir()), scope))
 
 
 def main(argv: list[str] | None = None) -> int:

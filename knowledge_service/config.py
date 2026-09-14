@@ -45,6 +45,8 @@ __all__ = [
     "get_father_root",
     "get_portable_model_dir",
     "get_portable_model_id",
+    "get_learning_dir",
+    "get_learning_runs_root",
 ]
 
 ENV_INI_PATH = "KNOWLEDGE_SERVICE_INI"
@@ -52,6 +54,7 @@ ENV_INI_PATH = "KNOWLEDGE_SERVICE_INI"
 _KNOWLEDGE_SECTION = "knowledge"
 _SERVICE_SECTION = "service"
 _PORTABLE_SECTION = "portable"
+_LEARNING_SECTION = "learning"
 
 _INDEX_DIR_DEFAULT = ".local/share/dpmtf/knowledge_index"
 _DB_PATH_DEFAULT = ".local/share/knowledge-service/knowledge.db"
@@ -250,3 +253,39 @@ def get_portable_model_id() -> str:
     return (
         _parser().get(_PORTABLE_SECTION, "model_id", fallback=_MODEL_ID_DEFAULT).strip()
     )
+
+
+# ── [learning] keys (validated learning artifacts) ──────────────────────
+
+
+def get_learning_dir() -> str:
+    """Directory holding learning artifacts, manifests and the ledger.
+
+    ``[learning] dir``; the default is ``learning`` inside the shared index
+    directory. An absolute value is returned unchanged; a relative value
+    resolves against ``Path.home()``, like every other path here.
+    """
+    configured = _parser().get(_LEARNING_SECTION, "dir", fallback="").strip()
+    if configured:
+        return _resolved_under_home(configured)
+    return str(Path(get_index_dir()) / "learning")
+
+
+def get_learning_runs_root() -> str:
+    """Root that proves a run closed SUCCESS (``[learning] runs_root``).
+
+    The closure check reads ``<runs_root>/<family>/runs/<run>/END-REPORT.md``
+    there. With no value configured the default is the installation's father
+    root plus ``.flowrunner`` — the run directories live beside the main
+    checkout — falling back to ``.flowrunner`` under the home directory when
+    no father root is configured. When the directory does not exist, the
+    check is skipped with a warning so a foreign machine can still admit by
+    hand.
+    """
+    configured = _parser().get(_LEARNING_SECTION, "runs_root", fallback="").strip()
+    if configured:
+        return _resolved_under_home(configured)
+    father_root = get_father_root()
+    if father_root:
+        return str(Path(father_root).expanduser() / ".flowrunner")
+    return str(Path.home() / ".flowrunner")

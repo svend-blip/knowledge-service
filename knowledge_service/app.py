@@ -29,6 +29,7 @@ from pathlib import Path
 
 from knowledge_service import config
 from knowledge_service import db
+from knowledge_service import learning
 from knowledge_service import maintenance as knowledge_maintenance
 from knowledge_service import indexer as knowledge_indexer
 from knowledge_service import retrieval_log, scope_guard, search
@@ -48,6 +49,29 @@ def _disabled_envelope(provider_key: str) -> dict:
         "results": [],
         "bounded": True,
     }
+
+
+def _learning_scope_is_empty(scope: str) -> bool:
+    """Whether a learning scope has nothing to retrieve.
+
+    Empty is: the registry row exists and counts zero documents, or the
+    index dir holds no store file for the scope. A row with documents and a
+    present store is not empty, so ordinary searches keep their path.
+    """
+    try:
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT document_count FROM knowledge_indexes WHERE scope = ?",
+                (scope,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        row = None
+    if row is not None and int(row["document_count"]) == 0:
+        return True
+    return not knowledge_maintenance.learning_store_present(scope)
 
 
 def _stderr_from_system_exit(exc: SystemExit) -> str:
@@ -93,6 +117,8 @@ def search_knowledge(
     run_id: str | None = None,
     handoff_id: str | None = None,
     flow_key: str | None = None,
+    evidence_level: str | None = None,
+    include_history: bool = False,
 ) -> dict:
     """Search the configured knowledge provider and record the retrieval.
 
@@ -105,6 +131,15 @@ def search_knowledge(
     to the configured values and are then clamped to the configured ceilings,
     so a caller may lower them but never raise them; the returned list is
     still defensively truncated to ``top_k``.
+
+    For the learning scopes (``experience``, and ``experience-history`` when
+    ``include_history`` is true) ``evidence_level`` is the minimum strength —
+    defaulting to ``approved_architecture``, i.e. the three strongest levels
+    pass — applied through the provider's metadata filters as an equality set
+    over the admitted levels. Other scopes ignore both parameters. A
+    learning scope whose registry row counts zero documents, or whose store
+    files are absent, answers with an empty result list and no provider
+    call.
     """
     from fastapi import HTTPException
 
@@ -134,7 +169,42 @@ def search_knowledge(
     except scope_guard.ScopeAccessDenied as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    provider_cls = search.resolve_provider(provider_key, scope=scope)
+    # History is only searched when it is asked for explicitly; the level
+    # filter exists for the learning scopes alone and reaches the provider
+    # as LEANN-style operator syntax (a set-membership equality over the
+    # admitted levels), which the portable provider understands as well.
+    effective_scope = scope
+    if include_history and scope == "experience":
+        effective_scope = "experience-history"
+
+    filters: dict | None = None
+    if effective_scope in learning.LEARNING_SCOPES:
+        filters = {"evidence_level": {"in": learning.levels_at_least(evidence_level)}}
+
+        if _learning_scope_is_empty(effective_scope):
+            # An empty or missing learning store has nothing to retrieve.
+            # Answer with the empty envelope — logged like any other
+            # retrieval — instead of letting a missing LEANN meta file
+            # surface out of the route as an error.
+            retrieval_log.record_retrieval(
+                provider=provider_key,
+                scope=effective_scope,
+                query=q,
+                results=[],
+                duration_ms=0,
+                agent_role=agent_role,
+                run_id=run_id,
+                handoff_id=handoff_id,
+                flow_key=flow_key,
+            )
+            return {
+                "enabled": True,
+                "provider": provider_key,
+                "results": [],
+                "bounded": True,
+            }
+
+    provider_cls = search.resolve_provider(provider_key, scope=effective_scope)
     provider = provider_cls()
 
     try:
@@ -145,7 +215,8 @@ def search_knowledge(
     start = time.perf_counter()
     results = provider.search(
         q,
-        scope=scope,
+        scope=effective_scope,
+        filters=filters,
         top_k=top_k,
         token_budget=token_budget,
     )
@@ -158,7 +229,7 @@ def search_knowledge(
 
     retrieval_log.record_retrieval(
         provider=provider_key,
-        scope=scope,
+        scope=effective_scope,
         query=q,
         results=results,
         duration_ms=duration_ms,
@@ -332,11 +403,22 @@ def create_app():
         run_id: str | None = None,
         handoff_id: str | None = None,
         flow_key: str | None = None,
+        evidence_level: str | None = None,
+        include_history: bool = False,
         _token: None = Depends(require_token),
     ) -> dict:
         """Search the configured knowledge provider and record the retrieval."""
         return search_knowledge(
-            q, scope, top_k, token_budget, agent_role, run_id, handoff_id, flow_key
+            q,
+            scope,
+            top_k,
+            token_budget,
+            agent_role,
+            run_id,
+            handoff_id,
+            flow_key,
+            evidence_level,
+            include_history,
         )
 
     @application.post("/v1/refresh")

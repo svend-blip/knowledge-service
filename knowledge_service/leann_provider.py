@@ -308,12 +308,19 @@ class LeannProvider(KnowledgeProvider):
         return f"{record.get('scope', '')}:{record['path']}"
 
     def _metadata_for(self, record: dict[str, Any]) -> dict[str, Any]:
-        """Map a manifest record onto LEANN passage metadata."""
-        return {
-            "id": self._passage_id(record),
-            "scope": record.get("scope", ""),
-            "path": record["path"],
-        }
+        """Map a manifest record onto LEANN passage metadata.
+
+        Extra keys under the record's own ``metadata`` mapping (the learning
+        manifests carry ``evidence_level``, ``repository``, ``family``,
+        ``run``, ``confidence`` and — for ecosystem — ``origin`` there) are
+        kept so metadata filters can match on them; the identity fields
+        ``id``, ``scope`` and ``path`` always come from the record itself.
+        """
+        metadata = dict(record.get("metadata") or {})
+        metadata["id"] = self._passage_id(record)
+        metadata["scope"] = record.get("scope", "")
+        metadata["path"] = record["path"]
+        return metadata
 
     def _passage_ids(self, records: list[dict[str, Any]]) -> list[str]:
         """Return the stable passage ids for all manifest records."""

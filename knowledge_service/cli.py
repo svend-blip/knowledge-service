@@ -2,8 +2,9 @@
 
 Invoked as ``python -m knowledge_service.cli <command>``. Commands:
 ``serve``, ``refresh``, ``refresh-all``, ``scopes``, ``grant``, ``revoke``,
-``import-registry``, ``download-model``. Errors are one clear line on stderr
-and exit code 1 — never a traceback.
+``import-registry``, ``download-model``, ``learning`` (with subcommands
+``validate``, ``admit``, ``retract``, ``list``, ``rebuild``). Errors are one
+clear line on stderr and exit code 1 — never a traceback.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from pathlib import Path
 from knowledge_service import config, db
 from knowledge_service import maintenance as knowledge_maintenance
 from knowledge_service import indexer as knowledge_indexer
+from knowledge_service import learning as knowledge_learning
 from knowledge_service.provider import ProviderNotReady
 
 __all__ = ["main"]
@@ -90,6 +92,13 @@ def _cmd_refresh_all(args: argparse.Namespace) -> int:
     failures = 0
     considered = 0
     for scope, location in pairs:
+        if knowledge_maintenance.is_learning_location(location):
+            print(
+                f"knowledge-service: skip {scope}: learning-managed scope "
+                "(rebuilt from its manifest by 'learning rebuild')",
+                file=sys.stderr,
+            )
+            continue
         repo_path = Path(location).expanduser() if location else None
         if repo_path is None or not repo_path.is_dir():
             print(
@@ -375,6 +384,32 @@ def _cmd_import_registry(args: argparse.Namespace) -> int:
         tgt.close()
 
 
+def _cmd_learning(args: argparse.Namespace) -> int:
+    """Run one ``learning`` subcommand; clean errors, exit 1 on refusal.
+
+    Admission and retraction append one ledger line under the learning
+    directory and rebuild the learning manifests and scopes; every action is
+    auditable there.
+    """
+    command = args.learning_command
+    try:
+        if command == "validate":
+            return knowledge_learning.validate_file(args.yaml_path)
+        if command == "admit":
+            return knowledge_learning.admit(args.yaml_path)
+        if command == "retract":
+            return knowledge_learning.retract(args.ref)
+        if command == "list":
+            return knowledge_learning.list_artifacts()
+        if command == "rebuild":
+            return knowledge_learning.rebuild()
+    except ProviderNotReady as exc:
+        return _fail(str(exc))
+    except OSError as exc:
+        return _fail(str(exc))
+    return _fail(f"unknown learning command: {command!r}")
+
+
 # ── parser ──────────────────────────────────────────────────────────────
 
 
@@ -410,6 +445,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     scopes = subparsers.add_parser("scopes", help="list the index registry")
     scopes.set_defaults(handler=_cmd_scopes)
+
+    learning_parser = subparsers.add_parser(
+        "learning", help="manage validated learning artifacts"
+    )
+    learning_sub = learning_parser.add_subparsers(
+        dest="learning_command", required=True
+    )
+    learning_validate = learning_sub.add_parser(
+        "validate", help="list the schema violations of one artifact YAML"
+    )
+    learning_validate.add_argument("yaml_path")
+    learning_validate.set_defaults(handler=_cmd_learning)
+    learning_admit = learning_sub.add_parser(
+        "admit", help="admit one validated artifact into experience"
+    )
+    learning_admit.add_argument("yaml_path")
+    learning_admit.set_defaults(handler=_cmd_learning)
+    learning_retract = learning_sub.add_parser(
+        "retract", help="move one admitted artifact to history"
+    )
+    learning_retract.add_argument("ref", help="family/run, e.g. 2000/029")
+    learning_retract.set_defaults(handler=_cmd_learning)
+    learning_list = learning_sub.add_parser(
+        "list", help="list admitted artifacts with topic, level and confidence"
+    )
+    learning_list.set_defaults(handler=_cmd_learning)
+    learning_rebuild = learning_sub.add_parser(
+        "rebuild", help="rewrite the learning manifests and rebuild the scopes"
+    )
+    learning_rebuild.set_defaults(handler=_cmd_learning)
 
     grant = subparsers.add_parser(
         "grant", help="grant an agent role access to an internal scope"

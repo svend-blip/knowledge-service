@@ -263,6 +263,60 @@ returns the configured default scope. Non-internal scopes are always
 reachable; internal ones (`dpmtf`, `dpmtf-*`) need a matching grant in
 `knowledge_scope_grants`, where a `NULL` `flow_key` means any flow.
 
+## Validated learning
+
+Three stores sit beside the repository scopes and hold what closed runs
+learned: `experience` (validated learning artifacts), `ecosystem` (the
+architecture implications promoted out of them), and `experience-history`
+(the superseded and retracted ones). They are built from manifests, not
+from a repository scan, and every artifact is a YAML document under
+`<learning_dir>/<family>/<run>.yaml` — `topic`, `problem`, `approach`,
+`result`, `failed_approaches`, `important_files` (repository-relative,
+forward slashes), `architecture_implications`, `confidence`, and a
+`validation` block. Roles draft artifacts inside their chains; the
+supervisor admits them — no model is involved in admission.
+
+Evidence levels order by strength: `tests`, `measured_runtime`,
+`approved_architecture`, `reviewer_conclusion`, `observation`
+(`hypothesis` is never admitted). `GET /v1/search` for the `experience`
+scope always filters through the provider's metadata filters with the
+levels at least as strong as `evidence_level` (default
+`approved_architecture`, so the three strongest levels pass); other scopes
+ignore the parameter. With `include_history=true` the search targets
+`experience-history` instead — otherwise history does not compete for the
+budget.
+
+```bash
+# validate one artifact YAML (exit 1 on violations)
+python -m knowledge_service.cli learning validate draft.yaml
+# admit a closed SUCCESS run: writes the artifact, applies supersedes,
+# rebuilds both scopes and their manifests
+python -m knowledge_service.cli learning admit draft.yaml
+python -m knowledge_service.cli learning retract 2000/029
+python -m knowledge_service.cli learning list
+python -m knowledge_service.cli learning rebuild
+```
+
+Admission refuses (exit 1, clean message) a failing schema check, a
+`hypothesis` level, or a run that is not closed SUCCESS — proven by an
+`END-REPORT.md` whose first `Status` line contains `SUCCESS` under
+`[learning] runs_root` (default: `.flowrunner` beside the installation's
+father root; a missing runs directory skips the check with a warning, so a
+foreign machine can still admit by hand). The status line may carry Markdown
+bold — `**Status:** SUCCESS` and `**Status: SUCCESS** — run closed.` both
+prove closure, decoration before the word is ignored. Superseding and retracting move
+the older artifact to `<learning_dir>/history/...` with `superseded_by` /
+`retracted_at` written into it; it stays retrievable through
+`include_history=true`. Every admission, supersede and retraction is one
+line in `<learning_dir>/LEDGER.md`. `refresh-all` skips the three learning
+scopes (their registry rows carry the learning directory as location); they
+are rebuilt by `learning rebuild` in seconds. An empty manifest leaves no
+store behind, and searching an emptied learning scope answers with an empty
+result list instead of reaching the provider.
+
+The two config keys are `[learning] dir` (default `<index_dir>/learning`)
+and `[learning] runs_root`. See `knowledge.ini.example`.
+
 ## Windows
 
 Today's `leann` implementation is Linux-only in three places: LEANN's compiled

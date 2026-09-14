@@ -107,22 +107,24 @@ CREATE TABLE IF NOT EXISTS knowledge_scope_grants (
     UNIQUE (scope, agent_role, flow_key)
 );
 
+DROP TRIGGER IF EXISTS knowledge_indexes_status_check_insert;
 CREATE TRIGGER IF NOT EXISTS knowledge_indexes_status_check_insert
 BEFORE INSERT ON knowledge_indexes
 FOR EACH ROW
-WHEN NEW.status IS NULL OR NEW.status NOT IN ('noop', 'changed', 'missing')
+WHEN NEW.status IS NULL OR NEW.status NOT IN ('noop', 'changed', 'missing', 'empty')
 BEGIN
     SELECT RAISE(ABORT,
-        'knowledge_indexes.status must be ''noop'' or ''changed'' or ''missing''');
+        'knowledge_indexes.status must be ''noop'' or ''changed'' or ''missing'' or ''empty''');
 END;
 
+DROP TRIGGER IF EXISTS knowledge_indexes_status_check_update;
 CREATE TRIGGER IF NOT EXISTS knowledge_indexes_status_check_update
 BEFORE UPDATE OF status ON knowledge_indexes
 FOR EACH ROW
-WHEN NEW.status IS NULL OR NEW.status NOT IN ('noop', 'changed', 'missing')
+WHEN NEW.status IS NULL OR NEW.status NOT IN ('noop', 'changed', 'missing', 'empty')
 BEGIN
     SELECT RAISE(ABORT,
-        'knowledge_indexes.status must be ''noop'' or ''changed'' or ''missing''');
+        'knowledge_indexes.status must be ''noop'' or ''changed'' or ''missing'' or ''empty''');
 END;
 """
 

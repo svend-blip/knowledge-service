@@ -598,6 +598,7 @@ _ALLOWED_ROOTS = frozenset(
         "torch",
         "typing",
         "uvicorn",
+        "yaml",
         "knowledge_service",
     }
 )

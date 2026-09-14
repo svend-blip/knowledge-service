@@ -46,3 +46,15 @@ model_dir = ~/.local/share/knowledge-service/models/paraphrase-multilingual-Mini
 # Model id recorded on every indexed passage, so a store shows which model
 # produced its embeddings.
 model_id = sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+
+[learning]
+# Directory holding validated learning artifacts (<family>/<run>.yaml), the
+# three learning manifests, their history subtree and LEDGER.md
+# (relative = under ~). Empty/unset: a directory named learning inside
+# index_dir above.
+dir = ~/.local/share/dpmtf/knowledge_index/learning
+# Root whose <family>/runs/<run>/END-REPORT.md proves a run closed SUCCESS
+# before admission (relative = under ~). Empty/unset: .flowrunner beside the
+# father_root repository. A missing directory skips the check with a
+# warning, so a foreign machine can still admit by hand.
+runs_root = ~/DPMtF-WebUI/.flowrunner

@@ -19,16 +19,20 @@ the ``<scope>.leann`` naming of the LEANN store, so both providers can coexist
 side by side in one index directory. Each row is one passage:
 
 ``passages(id TEXT PRIMARY KEY, scope TEXT, path TEXT, content TEXT,
-embedding BLOB, dim INTEGER, model TEXT)``
+embedding BLOB, dim INTEGER, model TEXT, metadata TEXT)``
 
 ``id`` is the stable ``<scope>:<path>`` pair used by the LEANN provider, so one
 manifest maps onto either store without translation. The embedding is a
 little-endian float32 blob of ``dim`` values written by whichever embedder is
-active, and ``model`` records the model id that produced it.
+active, ``model`` records the model id that produced it, and ``metadata`` is
+the JSON mapping of the manifest record's extra metadata (the learning
+scopes' evidence level and friends), so metadata equality filters work on
+this store exactly as on the LEANN one.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -57,7 +61,8 @@ CREATE TABLE IF NOT EXISTS passages (
     content TEXT,
     embedding BLOB,
     dim INTEGER,
-    model TEXT
+    model TEXT,
+    metadata TEXT
 )
 """
 
@@ -371,16 +376,26 @@ class PortableProvider(KnowledgeProvider):
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
         conn.execute(_SCHEMA_SQL)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(passages)")}
+        if "metadata" not in columns:
+            # Stores created before metadata filters existed gain the column
+            # on first connect; old rows keep NULL metadata and simply do not
+            # satisfy metadata filters, like LEANN treats missing fields.
+            conn.execute("ALTER TABLE passages ADD COLUMN metadata TEXT")
         return conn
 
     @staticmethod
     def _write_row(
         conn: sqlite3.Connection, record: dict[str, Any], vector: list[float], model_id: str
     ) -> None:
+        metadata = record.get("metadata")
+        metadata_json = json.dumps(
+            metadata if isinstance(metadata, dict) else {}, ensure_ascii=False
+        )
         conn.execute(
             "INSERT OR REPLACE INTO passages"
-            " (id, scope, path, content, embedding, dim, model)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " (id, scope, path, content, embedding, dim, model, metadata)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 PortableProvider._passage_id(record),
                 record.get("scope", ""),
@@ -389,6 +404,7 @@ class PortableProvider(KnowledgeProvider):
                 _encode_vector(vector),
                 len(vector),
                 model_id,
+                metadata_json,
             ),
         )
 
@@ -423,11 +439,11 @@ class PortableProvider(KnowledgeProvider):
         try:
             if scope is None:
                 return conn.execute(
-                    "SELECT id, scope, path, content, embedding, dim, model"
+                    "SELECT id, scope, path, content, embedding, dim, model, metadata"
                     " FROM passages"
                 ).fetchall()
             return conn.execute(
-                "SELECT id, scope, path, content, embedding, dim, model"
+                "SELECT id, scope, path, content, embedding, dim, model, metadata"
                 " FROM passages WHERE scope = ?",
                 (scope,),
             ).fetchall()
@@ -436,18 +452,50 @@ class PortableProvider(KnowledgeProvider):
 
     @staticmethod
     def _matches_filters(row: sqlite3.Row, filters: dict[str, Any] | None) -> bool:
-        """Whether a stored row satisfies every equality filter."""
+        """Whether a stored row satisfies every equality filter.
+
+        Column fields (``scope``, ``path``, ``model``) are compared directly.
+        Any other field comes from the JSON in the row's ``metadata`` column;
+        a row without that metadata fails the filter, matching how the LEANN
+        filter engine treats missing fields. Entries that are scalars, or
+        mappings of ``{"==": value}``, compare equality; entries that are
+        lists, or mappings of ``{"in": [...]}``, compare equality over a set
+        of allowed values — that is how the experience level filter expresses
+        its "at least" semantics. Unknown mapping operators keep the previous
+        behaviour: the first value is compared for equality.
+        """
+        metadata: dict[str, Any] = {}
+        raw_metadata = row["metadata"] if "metadata" in row.keys() else None
+        if raw_metadata:
+            try:
+                loaded = json.loads(raw_metadata)
+            except json.JSONDecodeError:
+                loaded = None
+            if isinstance(loaded, dict):
+                metadata = loaded
         for field, expected in (filters or {}).items():
-            if field not in _FILTER_COLUMNS:
-                continue
-            value = row[field] if field in row.keys() else None
-            if isinstance(expected, dict):
-                wanted = expected.get("==", next(iter(expected.values()), None))
-                if value != wanted:
-                    return False
-            elif value != expected:
+            if field in _FILTER_COLUMNS:
+                value = row[field] if field in row.keys() else None
+            else:
+                value = metadata.get(field)
+            if not PortableProvider._value_matches(value, expected):
                 return False
         return True
+
+    @staticmethod
+    def _value_matches(value: Any, expected: Any) -> bool:
+        """One filter entry against one field value, equality semantics."""
+        if isinstance(expected, dict):
+            if "in" in expected:
+                allowed = expected["in"]
+                if not isinstance(allowed, (list, tuple, set)):
+                    return False
+                return value in allowed
+            wanted = expected.get("==", next(iter(expected.values()), None))
+            return value == wanted
+        if isinstance(expected, (list, tuple, set)):
+            return value in expected
+        return value == expected
 
     @staticmethod
     def _apply_token_budget(
