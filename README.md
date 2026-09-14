@@ -46,7 +46,7 @@ A missing file is fine — every key has the default below. See
 | Key (`[knowledge]`) | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Master switch; `false` returns the disabled envelope |
-| `provider` | `none` | `none` or `leann`; unknown keys behave like `none` |
+| `provider` | `none` | `none`, `leann` or `portable`; unknown keys behave like `none` |
 | `scope` | `dpmtf-webui` | Default scope of this installation |
 | `top_k` | `8` | Result count fallback and ceiling |
 | `max_context_tokens` | `12000` | Context budget fallback and ceiling |
@@ -63,6 +63,59 @@ A missing file is fine — every key has the default below. See
 | `father_root` | *(empty)* | Repository whose scope is the default scope |
 
 Relative paths resolve under the home directory.
+
+| Key (`[portable]`) | Default | Meaning |
+|---|---|---|
+| `model_dir` | `~/.local/share/knowledge-service/models/paraphrase-multilingual-MiniLM-L12-v2` | Directory holding `onnx/model.onnx` and `tokenizer.json` |
+| `model_id` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | Model id recorded on every indexed passage |
+
+## Portable provider
+
+Measured 2026-09-14 by the reviewer on this host (CPU only,
+`paraphrase-multilingual-MiniLM-L12-v2`, 470 MB ONNX): building the
+`flowrunner` scope (656 passages) took 14.7 s, the store is 4.9 MB, and a
+search answers in 0.05 s. For comparison the `leann` provider builds the
+same scope in ~10 s on the GPU and searches in 8–9 s in-process (daemon-free)
+or ~1 s with a warm daemon. Top-3 results differ between the two models but
+both put the right file first on a concrete question
+(`internal/runtimechild/runtimechild.go` for "How does the desktop start a
+runtime child?").
+
+
+Two providers sit behind the same `KnowledgeProvider` interface. `leann` needs
+its compiled HNSW backend and a CUDA GPU. `portable` needs nothing but Python
+and `onnxruntime`: passages, metadata and embeddings live in one SQLite file per
+scope — `<index_dir>/<scope>.portable.db`, table `passages(id, scope, path,
+content, embedding, dim, model)` — the embeddings come from a small multilingual
+ONNX model running on the CPU, and a search is a cosine comparison of the query
+vector against the stored ones. Same manifests, same scopes, same `/v1` routes,
+same result shape (`path`, `content`, `score`, `scope`), same `top_k` default and
+token-budget truncation rule; slower and simpler.
+
+Choose `portable` where the GPU is not there or the compiled backend is not
+available: a Windows FlowApp, a small Linux box, a container. Keep `leann` where
+the GPU is resident and the throughput matters. Both stores coexist in one index
+directory because the portable store has its own suffix.
+
+```sh
+# one-time, needs a network: fetch only the files the provider reads
+./venv/bin/python -m knowledge_service.cli download-model
+```
+
+`download-model` prints the model directory and the size of each downloaded file
+(`onnx/model.onnx`, `tokenizer.json`, `config.json`, `tokenizer_config.json`,
+`special_tokens_map.json`), or one clean line and exit code 1 when there is no
+network. Point at it from the ini with `provider = portable`;
+`/v1/health` then reports the model directory state as
+`"preflight": {"ok": true, "detail": "model present: yes"}`.
+
+Measured numbers for the live run are filled in by the reviewer after TG6
+(build time for the flowrunner manifest, first-search latency, store size).
+
+| Provider | Runs on | Needs |
+|---|---|---|
+| `leann` | Linux | CUDA GPU plus the compiled LEANN backend |
+| `portable` | Any platform with Python 3.12 and `onnxruntime` wheels (Linux, Windows, macOS) | CPU only |
 
 ## Install on Linux
 
@@ -212,8 +265,9 @@ reachable; internal ones (`dpmtf`, `dpmtf-*`) need a matching grant in
 
 ## Windows
 
-Today's implementation is Linux-only in three places: LEANN's compiled
+Today's `leann` implementation is Linux-only in three places: LEANN's compiled
 backend, the CUDA free-memory preflight, and the systemd units. Path
 normalisation itself already works for both styles through the slug rule in
-`knowledge_service/scopes.py`. A `portable` provider that drops the compiled
-backend and the CUDA dependency is a later part.
+`knowledge_service/scopes.py`. The `portable` provider above is the part that
+drops the compiled backend and the CUDA dependency, so a Windows host runs the
+same service with `provider = portable` and needs no GPU.

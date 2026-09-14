@@ -272,7 +272,14 @@ def health() -> dict:
     detail = ""
     try:
         provider_cls = search.resolve_provider(provider_key, scope=config.get_scope())
-        provider_cls().preflight()
+        provider = provider_cls()
+        readiness = getattr(provider, "readiness_detail", None)
+        provider.preflight()
+        # A provider that describes its own readiness (the portable one reports
+        # whether its model files are present) fills the detail on success;
+        # others keep the empty detail.
+        if callable(readiness):
+            detail = str(readiness())
     except ProviderNotReady as exc:
         provider_ok = False
         detail = str(exc)

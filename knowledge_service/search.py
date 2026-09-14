@@ -2,12 +2,12 @@
 
 ``knowledge_service.app`` must stay free of any concrete provider name, so
 the configured-provider-key to provider-class mapping lives here.
-``"none"`` maps to the no-op ``NoneProvider`` and ``"leann"`` maps to the
-LEANN-backed provider. The LEANN-backed class is imported lazily inside its
-loader so importing this service layer never imports the optional LEANN
-dependency. Unknown provider keys resolve to ``NoneProvider`` and never
-raise, matching the disabled-by-default contract: a misconfigured provider
-key must not take the API down.
+``"none"`` maps to the no-op ``NoneProvider``, ``"leann"`` to the LEANN-backed
+provider and ``"portable"`` to the CPU-only provider. Both concrete classes are
+imported lazily inside their loaders so importing this service layer never
+imports an optional dependency. Unknown provider keys resolve to
+``NoneProvider`` and never raise, matching the disabled-by-default contract: a
+misconfigured provider key must not take the API down.
 """
 
 from __future__ import annotations
@@ -42,6 +42,27 @@ def _load_leann_provider(scope: str | None = None) -> Callable[[], KnowledgeProv
     )
 
 
+def _load_portable_provider(scope: str | None = None) -> Callable[[], KnowledgeProvider]:
+    """Return a PortableProvider factory bound to one scope's portable store.
+
+    The portable store lives beside the LEANN one with its own suffix, so both
+    providers can be built in the same index directory. The model directory
+    comes from ``[portable] model_dir``; the class is imported inside the
+    loader so importing this module stays cheap.
+    """
+    from knowledge_service.portable_provider import PortableProvider
+
+    store_path = (
+        Path(config.get_index_dir())
+        / f"{scope or config.get_scope()}.portable.db"
+    )
+    return functools.partial(
+        PortableProvider,
+        index_path=str(store_path),
+        model_dir=config.get_portable_model_dir(),
+    )
+
+
 # Maps a configured provider key to a zero-argument loader returning a
 # provider class or a bound factory (the leann loader binds index_path).
 # Loaders (rather than already-imported classes) keep the LEANN import lazy:
@@ -49,6 +70,7 @@ def _load_leann_provider(scope: str | None = None) -> Callable[[], KnowledgeProv
 PROVIDER_LOADERS: dict[str, Callable[[], KnowledgeProvider]] = {
     "none": lambda: NoneProvider,
     "leann": _load_leann_provider,
+    "portable": _load_portable_provider,
 }
 
 
@@ -57,14 +79,15 @@ def resolve_provider(name: str, scope: str | None = None) -> Callable[[], Knowle
 
     ``"none"`` resolves to the no-op provider, and any unknown key also
     resolves to it, so a misconfigured provider key can never raise. Only
-    ``"leann"`` receives ``scope``; the no-op provider, any unknown key, and
-    any other registered loader ignore it. Registered non-``none`` loaders
-    are still honoured so callers that temporarily extend
-    ``PROVIDER_LOADERS`` (the tests' stub provider) keep resolving through
-    this function.
+    ``"leann"`` and ``"portable"`` receive ``scope``, because both bind a
+    per-scope store path; the no-op provider, any unknown key, and any other
+    registered loader ignore it. Registered non-``none`` loaders are still
+    honoured so callers that temporarily extend ``PROVIDER_LOADERS`` (the
+    tests' stub provider) keep resolving through this function.
     """
-    if name == "leann":
-        return _load_leann_provider(scope)
+    if name in ("leann", "portable"):
+        loader = PROVIDER_LOADERS[name]
+        return loader(scope)  # type: ignore[call-arg]
     if name == "none":
         return NoneProvider
     loader = PROVIDER_LOADERS.get(name)

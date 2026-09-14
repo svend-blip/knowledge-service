@@ -2,8 +2,8 @@
 
 Invoked as ``python -m knowledge_service.cli <command>``. Commands:
 ``serve``, ``refresh``, ``refresh-all``, ``scopes``, ``grant``, ``revoke``,
-``import-registry``. Errors are one clear line on stderr and exit code 1 —
-never a traceback.
+``import-registry``, ``download-model``. Errors are one clear line on stderr
+and exit code 1 — never a traceback.
 """
 
 from __future__ import annotations
@@ -264,6 +264,51 @@ def _grant_present(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
     return found is not None
 
 
+_MODEL_FILES = (
+    "onnx/model.onnx",
+    "tokenizer.json",
+    "config.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+)
+
+
+def _cmd_download_model(args: argparse.Namespace) -> int:
+    """Fetch only the files the portable provider reads.
+
+    ``onnx/model.onnx``, ``tokenizer.json`` and the three small tokenizer
+    files — nothing else from the repository. The directory and each file's
+    size are printed so an operator can see what landed; without a network the
+    command prints one clean line and exits 1.
+    """
+    model_id = (args.model_id or config.get_portable_model_id()).strip()
+    if args.model_dir:
+        model_dir = Path(args.model_dir).expanduser()
+    else:
+        model_dir = Path(config.get_portable_model_dir())
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        return _fail(f"cannot download the model: {exc}")
+
+    try:
+        snapshot_download(
+            model_id, allow_patterns=list(_MODEL_FILES), local_dir=str(model_dir)
+        )
+    except Exception as exc:  # offline, missing repo, broken cache: one clean line
+        return _fail(f"cannot download {model_id} into {model_dir}: {exc}")
+
+    print(model_dir)
+    for name in _MODEL_FILES:
+        path = model_dir / name
+        if path.is_file():
+            print(f"{name}\t{path.stat().st_size} bytes")
+        else:
+            print(f"{name}\tmissing")
+    return 0
+
+
 def _cmd_import_registry(args: argparse.Namespace) -> int:
     """Copy the four knowledge tables once from another database.
 
@@ -385,6 +430,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_registry.add_argument("--from", dest="source", required=True)
     import_registry.set_defaults(handler=_cmd_import_registry)
+
+    download_model = subparsers.add_parser(
+        "download-model", help="fetch the portable provider's ONNX model files"
+    )
+    download_model.add_argument(
+        "--model-id", default=None, help="hugging face model id (default from ini)"
+    )
+    download_model.add_argument(
+        "--model-dir", default=None, help="directory to place the files in"
+    )
+    download_model.set_defaults(handler=_cmd_download_model)
 
     return parser
 

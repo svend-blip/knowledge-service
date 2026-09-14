@@ -8,7 +8,8 @@
 [knowledge]
 # Retrieval on/off. Keep false while a resident local model holds the GPU.
 enabled = true
-# none (no-op) or leann. Unknown keys behave like none.
+# none (no-op), leann (compiled backend + CUDA GPU) or portable (onnxruntime
+# on CPU, any platform). Unknown keys behave like none.
 provider = leann
 # Default scope of this installation: the scope of father_root below.
 scope = dpmtf-webui
@@ -35,3 +36,13 @@ db_path = ~/.local/share/knowledge-service/knowledge.db
 token =
 # Repository whose scope is the default scope above (empty = no mapping).
 father_root = /home/svend/DPMtF-WebUI
+
+[portable]
+# Model files for provider = portable. onnx/model.onnx and tokenizer.json are
+# read from here; fetch them once with
+#   python -m knowledge_service.cli download-model
+# (relative = under ~).
+model_dir = ~/.local/share/knowledge-service/models/paraphrase-multilingual-MiniLM-L12-v2
+# Model id recorded on every indexed passage, so a store shows which model
+# produced its embeddings.
+model_id = sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2

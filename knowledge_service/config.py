@@ -13,9 +13,10 @@ service at its own temporary directories at any point.
 The ``[knowledge]`` keys and defaults are the ones DPMtF carries today
 (enabled/provider/scope/top_k/max_context_tokens/max_document_chars/
 index_dir/min_free_vram_mib/leann_use_daemon). The ``[service]`` section is
-this service's own: host, port, db_path, token and father_root. Nothing in
-the package reads a path from anywhere else, so tests can point the whole
-service at temp directories through ``KNOWLEDGE_SERVICE_INI``.
+this service's own: host, port, db_path, token and father_root. The
+``[portable]`` section holds the CPU provider's model directory and model id.
+Nothing in the package reads a path from anywhere else, so tests can point the
+whole service at temp directories through ``KNOWLEDGE_SERVICE_INI``.
 """
 
 from __future__ import annotations
@@ -42,15 +43,23 @@ __all__ = [
     "get_db_path",
     "get_token",
     "get_father_root",
+    "get_portable_model_dir",
+    "get_portable_model_id",
 ]
 
 ENV_INI_PATH = "KNOWLEDGE_SERVICE_INI"
 
 _KNOWLEDGE_SECTION = "knowledge"
 _SERVICE_SECTION = "service"
+_PORTABLE_SECTION = "portable"
 
 _INDEX_DIR_DEFAULT = ".local/share/dpmtf/knowledge_index"
 _DB_PATH_DEFAULT = ".local/share/knowledge-service/knowledge.db"
+_MODEL_DIR_DEFAULT = (
+    ".local/share/knowledge-service/models/"
+    "paraphrase-multilingual-MiniLM-L12-v2"
+)
+_MODEL_ID_DEFAULT = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 _PARSER: ConfigParser | None = None
 _LOADED_ENV: str | None = None
@@ -218,3 +227,26 @@ def get_token() -> str:
 def get_father_root() -> str:
     """The repository path that maps to the configured default scope."""
     return _parser().get(_SERVICE_SECTION, "father_root", fallback="").strip()
+
+
+# ── [portable] keys (the CPU provider's own model) ──────────────────────
+
+
+def get_portable_model_dir() -> str:
+    """Directory holding the portable provider's ONNX model files.
+
+    ``onnx/model.onnx`` and ``tokenizer.json`` are read from here. An absolute
+    value is returned unchanged; a relative value resolves against
+    ``Path.home()``, so the default sits beside the service database.
+    """
+    configured = _parser().get(
+        _PORTABLE_SECTION, "model_dir", fallback=_MODEL_DIR_DEFAULT
+    )
+    return _resolved_under_home(configured)
+
+
+def get_portable_model_id() -> str:
+    """Model id recorded on every passage the portable provider writes."""
+    return (
+        _parser().get(_PORTABLE_SECTION, "model_id", fallback=_MODEL_ID_DEFAULT).strip()
+    )

@@ -15,9 +15,11 @@ import types
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 from knowledge_service import cli, config, db, maintenance
 from knowledge_service.app import create_app
+from knowledge_service.portable_provider import OnnxEmbedder, PortableProvider
 from knowledge_service.provider import ProviderNotReady
 from knowledge_service.scopes import scope_for_path
 from knowledge_service import search as search_module
@@ -575,19 +577,24 @@ _ALLOWED_ROOTS = frozenset(
         "fastapi",
         "fnmatch",
         "functools",
+        "huggingface_hub",
         "io",
         "json",
         "leann",
         "logging",
+        "numpy",
+        "onnxruntime",
         "os",
         "pathlib",
         "pydantic",
         "re",
         "shutil",
         "sqlite3",
+        "struct",
         "sys",
         "tempfile",
         "time",
+        "tokenizers",
         "torch",
         "typing",
         "uvicorn",
@@ -645,6 +652,7 @@ def test_package_never_imports_dpmtf():
             "knowledge_service.config",
             "knowledge_service.provider",
             "knowledge_service.leann_provider",
+            "knowledge_service.portable_provider",
             "knowledge_service.indexer",
             "knowledge_service.maintenance",
             "knowledge_service.scopes",
@@ -911,3 +919,301 @@ def test_guard_fixture_detects_a_write_outside_tmp(tmp_path):
         Path.home() / ".local/share/knowledge-service",
         Path.home() / ".local/share/dpmtf/knowledge_index",
     )
+
+
+# ── portable provider ───────────────────────────────────────────────────
+
+
+class FakeEmbedder:
+    """Deterministic embedder for tests: one axis per keyword, no dependency."""
+
+    dim = 3
+
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        return [
+            [1.0, 0.0, 0.0] if "apple" in text else [0.0, 1.0, 0.0]
+            for text in texts
+        ]
+
+
+def write_manifest(tmp_path, records) -> str:
+    """Write ``records`` as a JSONL manifest and return its path."""
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    return str(manifest)
+
+
+def model_home(tmp_path) -> Path:
+    """Create a model directory holding the two files the provider reads."""
+    directory = tmp_path / "model"
+    (directory / "onnx").mkdir(parents=True, exist_ok=True)
+    (directory / "onnx" / "model.onnx").write_bytes(b"fake-onnx")
+    (directory / "tokenizer.json").write_text("{}", encoding="utf-8")
+    return directory
+
+
+def portable_provider(tmp_path, embedder=None) -> PortableProvider:
+    return PortableProvider(
+        index_path=tmp_path / "store" / "s.portable.db",
+        model_dir=model_home(tmp_path),
+        embedder=embedder or FakeEmbedder(),
+    )
+
+
+def portable_ini(tmp_path, monkeypatch, extra: str = "") -> None:
+    write_ini(
+        tmp_path,
+        monkeypatch,
+        service_ini(tmp_path, monkeypatch)
+        + "\n[portable]\nmodel_dir = %s\n%s" % (tmp_path / "model", extra),
+    )
+
+
+def test_onnx_embedder_pools_a_realistic_session_output(tmp_path, monkeypatch):
+    """A real session returns (batch, seq, hidden); pooling must collapse it."""
+    import numpy as np
+
+    portable_ini(tmp_path, monkeypatch)
+
+    class FakeEncoded:
+        def __init__(self, ids):
+            self.ids = ids
+
+    class FakeTokenizer:
+        def encode(self, text, add_special_tokens=True):
+            # Two special tokens around one id per word, as a real tokenizer does.
+            return FakeEncoded(list(range(1, len(text.split()) + 3)))
+
+    class FakeSpec:
+        def __init__(self, name):
+            self.name = name
+
+    class FakeSession:
+        """Stands in for onnxruntime.InferenceSession, arrays only."""
+
+        def __init__(self):
+            self.feeds = []
+
+        def get_inputs(self):
+            return [FakeSpec("input_ids"), FakeSpec("attention_mask")]
+
+        def run(self, _, feeds):
+            self.feeds.append(dict(feeds))
+            ids = feeds["input_ids"]
+            batch, width = int(ids.shape[0]), int(ids.shape[1])
+            hidden = 4
+            out = np.zeros((batch, width, hidden), dtype=np.float32)
+            for position in range(width):
+                # Non-zero on padding positions too, so a pooling step that
+                # ignores the attention mask cannot look correct.
+                out[:, position, :] = np.asarray(
+                    [(position + 1) + 0.5 * h for h in range(hidden)],
+                    dtype=np.float32,
+                )
+            return [out]
+
+    texts = ["apple pie", "how is a flowapp exported"]
+    session = FakeSession()
+    embedder = OnnxEmbedder(
+        tmp_path / "model", session=session, tokenizer=FakeTokenizer()
+    )
+
+    vectors = embedder.embed(texts)
+
+    assert len(vectors) == len(texts)
+    assert [len(vector) for vector in vectors] == [4, 4]
+
+    lengths = [len(text.split()) + 2 for text in texts]
+    assert int(session.feeds[0]["attention_mask"].sum()) == sum(lengths)
+    assert session.feeds[0]["input_ids"].shape == (2, max(lengths))
+
+    for vector, length in zip(vectors, lengths):
+        # Mean over the real positions only: (pos + 1) averages to
+        # (length + 1) / 2, plus the hidden-axis offset. Then unit length.
+        expected = np.asarray(
+            [(length + 1) / 2 + 0.5 * h for h in range(4)], dtype=np.float32
+        )
+        expected = expected / np.linalg.norm(expected)
+        assert vector == pytest.approx([float(v) for v in expected], rel=1e-5, abs=1e-6)
+
+    # Padding to a longer batch partner leaves the shorter text's vector alone.
+    assert embedder.embed([texts[0]])[0] == pytest.approx(
+        [float(v) for v in vectors[0]], rel=1e-5, abs=1e-6
+    )
+    assert embedder.dim == 4
+
+
+def test_portable_index_search_roundtrip_with_fake_embedder(tmp_path, monkeypatch):
+    portable_ini(tmp_path, monkeypatch)
+    embedder = FakeEmbedder()
+    provider = portable_provider(tmp_path, embedder)
+    manifest = write_manifest(
+        tmp_path,
+        [
+            {"scope": "s", "path": "docs/a.md", "content": "apple pie"},
+            {"scope": "s", "path": "docs/b.md", "content": "banana split"},
+        ],
+    )
+
+    assert provider.index(manifest) is None
+
+    results = provider.search("apple", scope="s")
+    assert [item["path"] for item in results] == ["docs/a.md", "docs/b.md"]
+    assert results[0]["score"] == 1.0
+    assert results[1]["score"] == 0.0
+    assert results[0]["content"] == "apple pie"
+    assert results[0]["scope"] == "s"
+    assert set(results[0]) == {"path", "content", "score", "scope"}
+
+    # Embeddings go in as float32 blobs with their width and model id.
+    conn = sqlite3.connect(tmp_path / "store" / "s.portable.db")
+    rows = conn.execute(
+        "select id, dim, model, length(embedding) from passages order by id"
+    ).fetchall()
+    conn.close()
+    assert [row[0] for row in rows] == ["s:docs/a.md", "s:docs/b.md"]
+    assert {row[1] for row in rows} == {3}
+    assert {row[3] for row in rows} == {12}
+    assert {row[2] for row in rows} == {config.get_portable_model_id()}
+
+    # One batched call per index, then a single call for the query.
+    assert embedder.calls == [["apple pie", "banana split"], ["apple"]]
+
+
+def test_portable_update_replaces_and_remove_deletes(tmp_path, monkeypatch):
+    portable_ini(tmp_path, monkeypatch)
+    provider = portable_provider(tmp_path)
+    manifest = write_manifest(
+        tmp_path,
+        [
+            {"scope": "s", "path": "docs/a.md", "content": "apple pie"},
+            {"scope": "s", "path": "docs/b.md", "content": "banana split"},
+        ],
+    )
+    provider.index(manifest)
+
+    # A rewritten manifest replaces the passage under the same id and drops the
+    # one it no longer lists. Neither call is a no-op or NotImplementedError.
+    manifest = write_manifest(
+        tmp_path, [{"scope": "s", "path": "docs/a.md", "content": "apple crumble"}]
+    )
+    assert provider.update(manifest) is None
+    assert [item["content"] for item in provider.search("apple", scope="s")] == [
+        "apple crumble"
+    ]
+
+    assert provider.remove(manifest) is None
+    assert provider.search("apple", scope="s") == []
+
+
+def test_portable_scope_filter_and_token_budget(tmp_path, monkeypatch):
+    portable_ini(tmp_path, monkeypatch)
+    provider = portable_provider(tmp_path)
+    write_manifest(
+        tmp_path,
+        [
+            {"scope": "s", "path": "docs/a.md", "content": "apple one two three"},
+            {"scope": "other", "path": "docs/b.md", "content": "apple two"},
+        ],
+    )
+    provider.index(str(tmp_path / "manifest.jsonl"))
+
+    assert [item["scope"] for item in provider.search("apple", scope="s")] == ["s"]
+    assert [item["path"] for item in provider.search("apple", scope="other")] == [
+        "docs/b.md"
+    ]
+    filtered = provider.search("apple", scope="s", filters={"path": "docs/a.md"})
+    assert [item["path"] for item in filtered] == ["docs/a.md"]
+    assert provider.search("apple", scope="s", filters={"path": "docs/b.md"}) == []
+
+    # Same truncation rule as the LEANN provider: cut to fit, never pad.
+    bounded = provider.search("apple", scope="s", token_budget=2)
+    assert bounded[0]["content"] == "apple one"
+    assert len(provider.search("apple", scope="s", top_k=1)) == 1
+
+
+def test_portable_preflight_reports_missing_model(tmp_path, monkeypatch):
+    portable_ini(tmp_path, monkeypatch)
+    empty = tmp_path / "empty-model"
+    empty.mkdir()
+    missing = PortableProvider(
+        index_path=tmp_path / "s.portable.db",
+        model_dir=empty,
+        embedder=FakeEmbedder(),
+    )
+
+    # ``pytest.raises`` matches by class identity, and the import test reloads
+    # the package modules, so the check is on the name the interface promises.
+    with pytest.raises(Exception) as info:
+        missing.preflight()
+    assert type(info.value).__name__ == "ProviderNotReady"
+    message = str(info.value)
+    assert message.startswith("knowledge provider not ready:")
+    assert "model.onnx" in message and str(empty) in message
+    assert missing.readiness_detail() == "model present: no"
+
+    ready = portable_provider(tmp_path)
+    assert ready.preflight() is None
+    assert ready.readiness_detail() == "model present: yes"
+
+
+def test_resolve_provider_binds_portable_store_path(tmp_path, monkeypatch):
+    portable_ini(tmp_path, monkeypatch, extra="model_id = mini/model\n")
+
+    factory = search_module.resolve_provider("portable", scope="flowrunner")
+    provider = factory()
+    # Class identity moves when the import test reloads the package, so the
+    # check is on the promised class name.
+    assert type(provider).__name__ == "PortableProvider"
+    assert str(provider._index_path).endswith("flowrunner.portable.db")
+    assert str(tmp_path / "index_dir") in str(provider._index_path)
+    assert str(provider._model_dir) == str(tmp_path / "model")
+    assert config.get_portable_model_id() == "mini/model"
+
+    # Without an explicit scope the configured scope binds the store.
+    unscoped = search_module.resolve_provider("portable")()
+    assert str(unscoped._index_path).endswith("dpmtf-webui.portable.db")
+
+    # Defaults of the [portable] section, from an ini that does not mention it.
+    write_ini(tmp_path, monkeypatch, service_ini(tmp_path, monkeypatch))
+    assert config.get_portable_model_id() == (
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    )
+    assert config.get_portable_model_dir().endswith(
+        "knowledge-service/models/paraphrase-multilingual-MiniLM-L12-v2"
+    )
+
+
+@pytest.mark.parametrize("provider_key", ["none", "portable"])
+def test_provider_contract_is_shared(provider_key, tmp_path, monkeypatch):
+    """Both providers satisfy the same interface without raising."""
+    portable_ini(tmp_path, monkeypatch)
+    if provider_key == "none":
+        provider = search_module.resolve_provider("none")()
+    else:
+        provider = portable_provider(tmp_path)
+
+    manifest = write_manifest(
+        tmp_path, [{"scope": "s", "path": "docs/a.md", "content": "apple pie"}]
+    )
+
+    assert provider.preflight() is None
+    assert provider.index(manifest) is None
+    assert provider.update(manifest) is None
+
+    results = provider.search("apple", scope="s", top_k=3, token_budget=10)
+    assert isinstance(results, list)
+    for item in results:
+        assert {"path", "content", "score", "scope"} <= set(item)
+    if provider_key == "none":
+        assert results == []
+    else:
+        assert results[0]["path"] == "docs/a.md"
+
+    assert provider.remove(manifest) is None
