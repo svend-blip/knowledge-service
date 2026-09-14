@@ -93,8 +93,8 @@ Testgoals green when the reviewer measures them; `git status` limited to
 
 ```testgoals
 id: TG1
-what: the seven named readiness tests exist and pass and the whole suite is green
-run: cd /home/svend/knowledge-service && for t in package_imports_without_leann_torch_or_gpu portable_provider_paths_are_pathlib_and_no_posix_only_calls portable_build_and_search_round_trip_with_a_fake_embedder parity_script_reports_an_unavailable_provider_instead_of_raising parity_ini_inherits_the_operator_settings parity_rows_carry_per_query_latencies parity_reports_a_provider_that_fails_during_build; do grep -q "def test_$t" tests/test_portable_readiness.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
+what: the eight named readiness tests exist and pass and the whole suite is green
+run: cd /home/svend/knowledge-service && for t in package_imports_without_leann_torch_or_gpu portable_provider_paths_are_pathlib_and_no_posix_only_calls portable_build_and_search_round_trip_with_a_fake_embedder parity_script_reports_an_unavailable_provider_instead_of_raising parity_ini_inherits_the_operator_settings parity_rows_carry_per_query_latencies parity_reports_a_provider_that_fails_during_build parity_builds_each_provider_in_its_own_directory; do grep -q "def test_$t" tests/test_portable_readiness.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
 expect: exit 0
 
 id: TG2
@@ -170,6 +170,33 @@ traceback, losing the portable results. Required:
 
 Report as before with `git status` and TG1–TG3; the reviewer re-runs TG4
 when the GPU is free.
+
+## 4d. Correction 3 (reviewer, 2026-09-14 22:20Z) — the two builds share one index directory, so the second one is a noop
+
+Measured live after correction 2: LEANN was reported `failed:
+OutOfMemoryError …` as required, but the portable side then built in
+0.117 s and its store held 0 passages, so every portable row was empty
+(the first live run, where LEANN had failed at preflight before writing
+anything, gave five paths per query). Cause: both providers build into the
+same `--index-dir`; the LEANN attempt wrote the manifest
+`<index_dir>/dpmtf-webui.jsonl` before it died, and `refresh_scope` for
+the portable provider found an identical manifest on disk and returned
+`noop` without calling `provider.index`. Required:
+
+1. Each provider builds and searches in its own sub-directory —
+   `<index_dir>/leann/` and `<index_dir>/portable/` — with its own
+   run-scoped INI (`index_dir` and `db_path` inside that sub-directory),
+   so no manifest, store or registry is shared between the two builds and
+   neither provider's outcome can shadow the other's. `store_bytes` is
+   measured in the provider's own sub-directory.
+2. A new test, named exactly `test_parity_builds_each_provider_in_its_own_directory`
+   (stub LEANN whose `index` raises after the manifest exists, fake
+   portable completes; the portable store under `<index_dir>/portable/`
+   holds the manifest's passages and the rows are non-empty; the two
+   run-scoped INIs point at different `index_dir` values).
+3. TG1's named list gains that test (eight names). Nothing else changes.
+
+Report as before with `git status` and TG1–TG3; the reviewer re-runs TG4.
 
 ## 5. Initial Execution Instruction
 
