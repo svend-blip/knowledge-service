@@ -1,137 +1,124 @@
-# SCOPE — knowledge-service A2-3: admission from run directories, pending drafts
+# SCOPE — knowledge-service A3-1: the portable provider end-to-end, and Windows readiness
 
 Treat this file as the complete project scope for this workspace
 (`/home/svend/knowledge-service`). Re-initialise scope-mcp (`init_project`
 with `reset: true`), ask only what is genuinely necessary, then build. The
-service is live on `http://127.0.0.1:9140` from commit `206040a` (A2-2
-reviewed and merged). Read DPMtF's `docs/LEARNING-ARTIFACT.md` and
-`docs/governance-templates-v2/SUPERVISOR_PLANNING.md` §Phase 6 first (read
-only): they bind what the decomposer writes and what the supervisor does.
+service is live on `http://127.0.0.1:9140` from commit `2f6f61c`. Read
+DPMtF's `docs/SCOPE-ADDENDUM-KNOWLEDGE-3-HARNESSES.md` §"Platform
+independence" first (read only).
 
 ## 1. Purpose
 
-DPMtF's decomposer now writes `<runs_root>/<family>/runs/<run>/LEARNING-DRAFT.yaml`
-at every SUCCESS closure with `admitted_by: pending`; the supervisor admits
-it. Today admission means copying the file somewhere, editing
-`admitted_by` by hand and calling `learning admit <path>`. Three gaps:
-
-1. No command admits a run's draft in place with the admitter's name.
-2. Nothing lists the drafts that wait for admission, or whether their run
-   actually closed SUCCESS.
-3. The ledger does not say where an admitted artifact came from.
+The portable provider (SQLite + onnxruntime, no compiled backend, no GPU)
+exists and passes its hermetic tests, but nothing yet proves it can carry a
+real scope end-to-end, nothing compares its answers with the LEANN
+provider's, and nothing proves the package imports and runs where LEANN,
+torch and a GPU are absent (the Windows PC). This scope adds the
+instrument and the proofs; the reviewer runs the live parts with the real
+model on this machine.
 
 ## 2. Deliverable
 
-### 2.1 Admission from a run directory (`knowledge_service/learning.py`, `cli.py`)
+### 2.1 Parity instrument (`scripts/provider_parity.py`, new)
 
-- `draft_path(family, run) -> Path`: `<runs_root>/<family>/runs/<run>/LEARNING-DRAFT.yaml`
-  (`config.get_learning_runs_root()`).
-- `admit_run(ref: str, admitted_by: str) -> int`: `ref` is
-  `"<family>/<run>"` (reuse `_split_ref`). Refuses (exit 1, clean message):
-  a malformed ref, a missing draft, an empty `admitted_by`, or the value
-  `pending` (case-insensitive). Loads the draft, sets `admitted_by` to the
-  given name, then runs exactly the existing `admit` path on the document
-  (validate → closure check → supersedes → write → ledger → rebuild) —
-  factor the document-level part of `admit(path)` into
-  `admit_document(doc, source: str) -> int` and let both entry points call
-  it. The draft file itself is never modified or moved.
-- `validate_run(ref: str) -> int`: prints the violations of the run's
-  draft (like `validate_file`), plus one line `run status: <SUCCESS|BLOCKED|…|missing>`
-  from the END-REPORT's first Status line (Markdown stripped, as
-  `_check_run_closed` does; `missing` when there is no END-REPORT). Never
-  admits.
-- Ledger line: the existing five columns unchanged, plus a sixth
-  `| source=<path>` — the draft path for `admit_run`, the given file path
-  for `admit`. The existing ledger test keeps its assertions on the first
-  five columns.
-- CLI: `learning admit-run <family>/<run> --admitted-by <name>`,
-  `learning validate-run <family>/<run>`, `learning drafts` (2.2's list,
-  one tab-separated line per draft). Existing subcommands unchanged.
+`python scripts/provider_parity.py --scope <name> --repo <path> --queries <file> [--index-dir <tmp>] [--top-k 5] [--json]`
+builds the scope twice into a temporary index directory — once with the
+`leann` provider, once with the `portable` provider, both through the
+package's own indexer/maintenance path (`knowledge_service.maintenance`
+functions, not shell-outs) — runs every query line of `<file>` against
+both, and prints one table row per query: `query`, `leann_top` (paths),
+`portable_top`, `jaccard@k`, `leann_ms`, `portable_ms`, plus a summary
+line with mean Jaccard, mean latency per provider, build seconds and
+store size per provider. `--json` prints the same as one JSON document.
+A provider whose preflight fails (no GPU, no model files) is reported in
+the summary as `unavailable: <detail>` and its columns stay empty — the
+script never raises for that. It writes only under `--index-dir` (default
+a `tempfile.mkdtemp`) and never touches the shared index directory or the
+registry database (use in-memory or temp registry paths).
 
-### 2.2 Pending drafts (`learning.py`, `app.py`)
+### 2.2 Windows-readiness proofs (`tests/test_portable_readiness.py`, new)
 
-- `list_pending_drafts() -> list[dict]`: scans
-  `<runs_root>/*/runs/*/LEARNING-DRAFT.yaml`; one dict per draft:
-  `family`, `run`, `topic`, `evidence_level`, `run_status` (as in
-  `validate_run`), `admitted` (an artifact for `family/run` exists under
-  the learning dir OR its history), `valid` (bool), `violations` (count).
-  Sorted by `family`, then `run`. A draft that does not parse is listed
-  with `valid` false, `violations` 1 and `topic` empty. A missing
-  `runs_root` is an empty list.
-- `GET /v1/learning/drafts` → `{"drafts": [...]}`; `?pending=true`
-  (default false) keeps only `admitted == false`. Read-only, no scope
-  guard (like `/v1/learning`).
+Named exactly:
+- `test_package_imports_without_leann_torch_or_gpu`: in a subprocess whose
+  `sys.modules` pre-seeds `leann`, `leann_backend_hnsw`, `torch` and
+  `numpy`? — no: only `leann`, `leann_backend_hnsw` and `torch` are
+  blocked (an import hook that raises `ImportError` for them); importing
+  `knowledge_service`, `knowledge_service.app`, `knowledge_service.cli`,
+  `knowledge_service.portable_provider`, `knowledge_service.learning` and
+  `knowledge_service.maintenance` succeeds, and `create_app()` returns an
+  app when the configured provider is `portable`.
+- `test_portable_provider_paths_are_pathlib_and_no_posix_only_calls`: the
+  portable provider module and `config.py` use `pathlib` for every path
+  they build (no `os.path.join` with `/` literals), and `chmod`, `fcntl`,
+  `os.geteuid` and `signal` are not referenced in `portable_provider.py`
+  or `learning.py` (grep over the source text; `db.py`'s owner-only file
+  creation may keep its guarded `chmod`).
+- `test_portable_build_and_search_round_trip_with_a_fake_embedder`:
+  build a three-document manifest into a temp SQLite store with the fake
+  embedder, search, and get the expected top-1 (exists in spirit already —
+  make it the named proof if a similar test exists, otherwise add it).
+- `test_parity_script_reports_an_unavailable_provider_instead_of_raising`
+  (drive `scripts/provider_parity.py` in-process with a stub LEANN
+  provider whose `preflight` raises `ProviderNotReady` and the fake
+  portable embedder; the summary names `unavailable`).
 
-### 2.3 Tests (hermetic, temp dirs, stub provider), named exactly
+### 2.3 CLI and README
 
-- `test_admit_run_reads_the_draft_from_the_runs_root_and_sets_admitted_by`
-  (a temp runs root with `2000/runs/041/LEARNING-DRAFT.yaml` carrying
-  `admitted_by: pending` and an END-REPORT `**Status:** SUCCESS`; after
-  `admit_run("2000/041", "svend")` the admitted artifact carries
-  `admitted_by: svend`, the draft file is byte-identical, the ledger line
-  ends with `source=` + the draft path)
-- `test_admit_run_refuses_pending_missing_and_unclosed`
-  (`--admitted-by pending` → 1; missing draft → 1; END-REPORT
-  `**Status:** BLOCKED` → 1 and nothing written)
-- `test_validate_run_reports_violations_and_run_status_without_admitting`
-- `test_drafts_route_lists_pending_drafts_with_run_status`
-  (two families, three drafts, one already admitted → `admitted` true;
-  `?pending=true` drops it; a broken YAML is listed invalid)
-- `test_cli_learning_admit_run_and_drafts` (through the CLI entry point:
-  `learning drafts` prints one line per draft; `learning admit-run` exits 0
-  and the same path as the function)
-
-Every existing test stays green.
-
-### 2.4 README
-
-`## Validated learning`: the three new commands, the drafts route, the
-ledger's `source=` column, and the sentence that the supervisor admits
-with `learning admit-run <family>/<run> --admitted-by <name>`.
+- `knowledge_service.cli download-model` already exists; document it
+  under `## Windows` with the exact sequence a fresh Windows machine runs:
+  `pip install -r requirements-portable.txt` (a new file listing only
+  `fastapi`, `uvicorn`, `pyyaml`, `onnxruntime`, `tokenizers`, `numpy`,
+  `zstandard`? — no, only what the portable path imports; derive it from
+  the imports, do not guess), `download-model`, `knowledge.ini` with
+  `provider = portable`, `refresh`, `search`. State that `leann` and
+  `torch` are not installed on that machine and that the package must not
+  require them.
+- `## Parity` section: how to run `scripts/provider_parity.py` and how to
+  read Jaccard@k.
 
 ## 3. Constraints
 
 As before: work only here; never modify DPMtF, mcp-light, the shared
 index directory or `~/.local/share/knowledge-service/`; no commits; no
-network; interpreter `/home/svend/DPMtF-WebUI/venv/bin/python`; no new
-dependencies; parameterized SQL; en-US; no services or models touched;
-`py_compile` every changed file; the 46 existing tests stay green. The
-live service on 9140 keeps running and is not restarted by you. Never
-read or write under DPMtF's `.flowrunner/` — the tests use temp runs roots.
+network (the model download is the reviewer's); interpreter
+`/home/svend/DPMtF-WebUI/venv/bin/python`; no new dependencies;
+parameterized SQL; en-US; no services or models touched; `py_compile`
+every changed file; the 51 existing tests stay green. The live service on
+9140 keeps running and is not restarted by you.
 
 ## 4. Definition of Done
 
 Testgoals green when the reviewer measures them; `git status` limited to
-`knowledge_service/`, `tests/`, `README.md`; coverage recorded;
-`complete_project` called.
+`knowledge_service/`, `scripts/`, `tests/`, `README.md`,
+`requirements-portable.txt`; coverage recorded; `complete_project` called.
 
 ```testgoals
 id: TG1
-what: the five named tests exist and pass and the whole suite is green
-run: cd /home/svend/knowledge-service && for t in admit_run_reads_the_draft_from_the_runs_root_and_sets_admitted_by admit_run_refuses_pending_missing_and_unclosed validate_run_reports_violations_and_run_status_without_admitting drafts_route_lists_pending_drafts_with_run_status cli_learning_admit_run_and_drafts; do grep -q "def test_$t" tests/*.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
+what: the four named readiness tests exist and pass and the whole suite is green
+run: cd /home/svend/knowledge-service && for t in package_imports_without_leann_torch_or_gpu portable_provider_paths_are_pathlib_and_no_posix_only_calls portable_build_and_search_round_trip_with_a_fake_embedder parity_script_reports_an_unavailable_provider_instead_of_raising; do grep -q "def test_$t" tests/test_portable_readiness.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
 expect: exit 0
 
 id: TG2
-what: the functions, the route, the CLI verbs and the README carry the new surface
-run: cd /home/svend/knowledge-service && grep -q "def admit_run" knowledge_service/learning.py && grep -q "def validate_run" knowledge_service/learning.py && grep -q "def list_pending_drafts" knowledge_service/learning.py && grep -q "def admit_document" knowledge_service/learning.py && grep -q "/v1/learning/drafts" knowledge_service/app.py && grep -q '"admit-run"' knowledge_service/cli.py && grep -q '"validate-run"' knowledge_service/cli.py && grep -q '"drafts"' knowledge_service/cli.py && grep -q "admit-run" README.md
+what: the parity script exists, compiles, and names both providers, jaccard and the unavailable path; the portable requirements file and README sections exist
+run: cd /home/svend/knowledge-service && test -f scripts/provider_parity.py && /home/svend/DPMtF-WebUI/venv/bin/python -m py_compile scripts/provider_parity.py && grep -q "jaccard" scripts/provider_parity.py && grep -q "unavailable" scripts/provider_parity.py && grep -q "portable" scripts/provider_parity.py && test -f requirements-portable.txt && ! grep -q -i "^leann\|^torch" requirements-portable.txt && grep -q "^## Windows" README.md && grep -q "^## Parity" README.md && grep -q "download-model" README.md
 expect: exit 0
 
 id: TG3
 what: FENCE — only the deliverable paths changed
-run: cd /home/svend/knowledge-service && test -n "$(git status --porcelain)" && test -z "$(git status --porcelain | awk '{print $2}' | grep -v -E '^(knowledge_service/|tests/|README.md)')"
+run: cd /home/svend/knowledge-service && test -n "$(git status --porcelain)" && test -z "$(git status --porcelain | awk '{print $2}' | grep -v -E '^(knowledge_service/|scripts/|tests/|README.md|requirements-portable.txt)')"
 expect: exit 0
 
 id: TG4
-what: LIVE (reviewer only) — the first real LEARNING-DRAFT of a closed DPMtF run is admitted with admit-run against the live config and answers on 9140
-run: test -f /tmp/claude-1000/-home-svend-DPMtF-WebUI/e20394ae-27d0-4204-804f-5d6a2f5da054/scratchpad/a2-3-live/ok
+what: LIVE (reviewer only) — with the real ONNX model downloaded, the parity script builds dpmtf-webui with both providers and reports Jaccard@5 and latencies
+run: test -f /tmp/claude-1000/-home-svend-DPMtF-WebUI/e20394ae-27d0-4204-804f-5d6a2f5da054/scratchpad/a3-1-live/ok
 expect: exit 0
 ```
 
 ## 5. Initial Execution Instruction
 
-`init_project` with `reset: true`; goals for 2.1–2.4 in order; checkpoint
+`init_project` with `reset: true`; goals for 2.1–2.3 in order; checkpoint
 after each goal; ask now, in one message, only what is genuinely ambiguous;
 implement; run TG1–TG3 and `py_compile`; record coverage;
 `complete_project`; report `git status` and the pasted output of TG1–TG3.
-TG4 is the reviewer's, after the reviewer restarts the service; do not
-attempt it and do not restart anything.
+TG4 is the reviewer's (it downloads the model); do not attempt it, do not
+download anything and do not restart anything.
