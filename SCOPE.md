@@ -1,208 +1,121 @@
-# SCOPE — knowledge-service A3-1: the portable provider end-to-end, and Windows readiness
+# SCOPE — knowledge-service A2-4: the learning artifact key carries the repository
 
 Treat this file as the complete project scope for this workspace
 (`/home/svend/knowledge-service`). Re-initialise scope-mcp (`init_project`
 with `reset: true`), ask only what is genuinely necessary, then build. The
-service is live on `http://127.0.0.1:9140` from commit `2f6f61c`. Read
-DPMtF's `docs/SCOPE-ADDENDUM-KNOWLEDGE-3-HARNESSES.md` §"Platform
-independence" first (read only).
+service is live on `http://127.0.0.1:9140` from commit `2d2ba3d`; one real
+artifact is admitted (`2000/040`, repository DPMtF-WebUI).
 
 ## 1. Purpose
 
-The portable provider (SQLite + onnxruntime, no compiled backend, no GPU)
-exists and passes its hermetic tests, but nothing yet proves it can carry a
-real scope end-to-end, nothing compares its answers with the LEANN
-provider's, and nothing proves the package imports and runs where LEANN,
-torch and a GPU are absent (the Windows PC). This scope adds the
-instrument and the proofs; the reviewer runs the live parts with the real
-model on this machine.
+Learning artifacts are keyed `<family>/<run>` (`<learning_dir>/<family>/<run>.yaml`,
+ledger refs, `supersedes`, passage paths). Two repositories now run the
+same family numbers: DPMtF-WebUI's run `2000/001` and FlowRunner's run
+`2000/001` (its own `.flowrunner/2000/` root, first run closed 2026-09-14).
+Their artifacts would overwrite each other, and `admit-run` / `drafts` look
+only under one `runs_root` (DPMtF's). The repository must be part of the
+key, and drafts must be found under every repository the service knows.
 
 ## 2. Deliverable
 
-### 2.1 Parity instrument (`scripts/provider_parity.py`, new)
+### 2.1 Key and layout (`knowledge_service/learning.py`)
 
-`python scripts/provider_parity.py --scope <name> --repo <path> --queries <file> [--index-dir <tmp>] [--top-k 5] [--json]`
-builds the scope twice into a temporary index directory — once with the
-`leann` provider, once with the `portable` provider, both through the
-package's own indexer/maintenance path (`knowledge_service.maintenance`
-functions, not shell-outs) — runs every query line of `<file>` against
-both, and prints one table row per query: `query`, `leann_top` (paths),
-`portable_top`, `jaccard@k`, `leann_ms`, `portable_ms`, plus a summary
-line with mean Jaccard, mean latency per provider, build seconds and
-store size per provider. `--json` prints the same as one JSON document.
-A provider whose preflight fails (no GPU, no model files) is reported in
-the summary as `unavailable: <detail>` and its columns stay empty — the
-script never raises for that. It writes only under `--index-dir` (default
-a `tempfile.mkdtemp`) and never touches the shared index directory or the
-registry database (use in-memory or temp registry paths).
+- The artifact identity is `<repository>/<family>/<run>`, where
+  `<repository>` is the artifact's `repository` field normalised to the
+  scope slug the service already uses for that repository (the slug rule
+  of `/v1/scope-for-path`; `DPMtF-WebUI` → `dpmtf-webui`, `FlowRunner` →
+  `flowrunner`). Files live at `<learning_dir>/<repository>/<family>/<run>.yaml`,
+  history at `<learning_dir>/history/<repository>/<family>/<run>.yaml`.
+  Passage `path` and ledger refs use the three-part key.
+- `supersedes` entries accept `"<repository>/<family>/<run>"` and, for
+  compatibility, `"<family>/<run>"` meaning the same repository as the
+  artifact; `validate` reports a malformed reference either way.
+- One-time migration on `learning rebuild` and on every `admit`: an
+  artifact found at the legacy `<learning_dir>/<family>/<run>.yaml` (or
+  its history twin) is moved under its `repository` slug, one ledger
+  line `migrated` per artifact, idempotent. Manifests are rebuilt from the
+  new layout.
 
-### 2.2 Windows-readiness proofs (`tests/test_portable_readiness.py`, new)
+### 2.2 Runs roots per repository (`learning.py`, `config.py`)
 
-Named exactly:
-- `test_package_imports_without_leann_torch_or_gpu`: in a subprocess with
-  an import hook that raises `ImportError` for `leann`,
-  `leann_backend_hnsw` and `torch` (nothing else is blocked); importing
-  `knowledge_service`, `knowledge_service.app`, `knowledge_service.cli`,
-  `knowledge_service.portable_provider`, `knowledge_service.learning` and
-  `knowledge_service.maintenance` succeeds, and `create_app()` returns an
-  app when the configured provider is `portable`.
-- `test_portable_provider_paths_are_pathlib_and_no_posix_only_calls`: the
-  portable provider module and `config.py` use `pathlib` for every path
-  they build (no `os.path.join` with `/` literals), and `chmod`, `fcntl`,
-  `os.geteuid` and `signal` are not referenced in `portable_provider.py`
-  or `learning.py` (grep over the source text; `db.py`'s owner-only file
-  creation may keep its guarded `chmod`).
-- `test_portable_build_and_search_round_trip_with_a_fake_embedder`:
-  build a three-document manifest into a temp SQLite store with the fake
-  embedder, search, and get the expected top-1 (exists in spirit already —
-  make it the named proof if a similar test exists, otherwise add it).
-- `test_parity_script_reports_an_unavailable_provider_instead_of_raising`
-  (drive `scripts/provider_parity.py` in-process with a stub LEANN
-  provider whose `preflight` raises `ProviderNotReady` and the fake
-  portable embedder; the summary names `unavailable`).
+- `[learning] runs_root` becomes the DPMtF default only; the runs root of
+  any repository is `<registry location>/.flowrunner`, where the location
+  is the `knowledge_indexes` row of that repository's scope (the same rows
+  `/v1/scopes` lists). A repository without a registry row falls back to
+  `[learning] runs_root` when its slug is the father's, else is reported
+  `unknown repository`.
+- `draft_path(repository, family, run)`, `admit_run("<repository>/<family>/<run>", admitted_by)`,
+  `validate_run(...)`: three-part refs; the legacy two-part ref means the
+  father repository. `list_pending_drafts()` scans
+  `<runs root>/*/runs/*/LEARNING-DRAFT.yaml` for every registered
+  repository and carries `repository` on each row; `/v1/learning/drafts`
+  and `learning drafts` show it. The admitted draft's `repository` field
+  must match the repository it was found under (else refused).
 
-### 2.3 CLI and README
+### 2.3 Routes and CLI
 
-- `knowledge_service.cli download-model` already exists; document it
-  under `## Windows` with the exact sequence a fresh Windows machine runs:
-  `pip install -r requirements-portable.txt` (a new file listing only
-  what the portable path actually imports — derive it from the imports of
-  the modules the service loads with `provider = portable`; do not
-  guess), `download-model`, `knowledge.ini` with
-  `provider = portable`, `refresh`, `search`. State that `leann` and
-  `torch` are not installed on that machine and that the package must not
-  require them.
-- `## Parity` section: how to run `scripts/provider_parity.py` and how to
-  read Jaccard@k.
+`GET /v1/learning` rows gain `repository`; `?repository=<slug>` filters.
+`learning list`, `learning drafts`, `admit-run`, `validate-run`, `retract`
+take three-part refs (two-part = father). README §Validated learning
+updated for the key, the layout, the migration line and the per-repository
+runs roots.
+
+### 2.4 Tests (hermetic, temp dirs, stub provider), named exactly
+
+- `test_artifact_key_carries_the_repository_slug` (two artifacts
+  `dpmtf-webui/2000/001` and `flowrunner/2000/001` coexist; passage paths
+  and ledger lines carry the three-part key)
+- `test_legacy_layout_is_migrated_once_with_a_ledger_line`
+- `test_supersedes_accepts_two_and_three_part_references`
+- `test_drafts_are_found_under_every_registered_repository` (a temp
+  registry with two repository scopes whose locations hold `.flowrunner`
+  trees; `list_pending_drafts` returns both with `repository`;
+  `?repository=` filters)
+- `test_admit_run_refuses_a_draft_whose_repository_does_not_match`
+- `test_learning_routes_and_cli_take_three_part_refs`
+
+Every existing test stays green (adapt only the ones that assert the old
+two-part layout, keeping their meaning).
 
 ## 3. Constraints
 
 As before: work only here; never modify DPMtF, mcp-light, the shared
 index directory or `~/.local/share/knowledge-service/`; no commits; no
-network (the model download is the reviewer's); interpreter
-`/home/svend/DPMtF-WebUI/venv/bin/python`; no new dependencies;
-parameterized SQL; en-US; no services or models touched; `py_compile`
-every changed file; the 51 existing tests stay green. The live service on
-9140 keeps running and is not restarted by you.
+network; interpreter `/home/svend/DPMtF-WebUI/venv/bin/python`; no new
+dependencies; parameterized SQL; en-US; no services or models touched;
+`py_compile` every changed file; the 59 existing tests stay green. The
+live service on 9140 keeps running and is not restarted by you. Never
+read or write under any real `.flowrunner/` — tests use temp roots.
 
 ## 4. Definition of Done
 
-Testgoals green when the reviewer measures them; `git status` limited to
-`knowledge_service/`, `scripts/`, `tests/`, `README.md`,
-`requirements-portable.txt`; coverage recorded; `complete_project` called.
-
 ```testgoals
 id: TG1
-what: the eight named readiness tests exist and pass and the whole suite is green
-run: cd /home/svend/knowledge-service && for t in package_imports_without_leann_torch_or_gpu portable_provider_paths_are_pathlib_and_no_posix_only_calls portable_build_and_search_round_trip_with_a_fake_embedder parity_script_reports_an_unavailable_provider_instead_of_raising parity_ini_inherits_the_operator_settings parity_rows_carry_per_query_latencies parity_reports_a_provider_that_fails_during_build parity_builds_each_provider_in_its_own_directory; do grep -q "def test_$t" tests/test_portable_readiness.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
+what: the six named tests exist and pass and the whole suite is green
+run: cd /home/svend/knowledge-service && for t in artifact_key_carries_the_repository_slug legacy_layout_is_migrated_once_with_a_ledger_line supersedes_accepts_two_and_three_part_references drafts_are_found_under_every_registered_repository admit_run_refuses_a_draft_whose_repository_does_not_match learning_routes_and_cli_take_three_part_refs; do grep -q "def test_$t" tests/*.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
 expect: exit 0
 
 id: TG2
-what: the parity script exists, compiles, and names both providers, jaccard and the unavailable path; the portable requirements file and README sections exist
-run: cd /home/svend/knowledge-service && test -f scripts/provider_parity.py && /home/svend/DPMtF-WebUI/venv/bin/python -m py_compile scripts/provider_parity.py && grep -q "jaccard" scripts/provider_parity.py && grep -q "unavailable" scripts/provider_parity.py && grep -q "portable" scripts/provider_parity.py && test -f requirements-portable.txt && ! grep -q -i "^leann\|^torch" requirements-portable.txt && grep -q "^## Windows" README.md && grep -q "^## Parity" README.md && grep -q "download-model" README.md
+what: the three-part key, the migration and the per-repository runs roots are wired and documented
+run: cd /home/svend/knowledge-service && grep -q "migrated" knowledge_service/learning.py && grep -q "repository" knowledge_service/learning.py && grep -q "\.flowrunner" knowledge_service/learning.py && grep -q '"repository"' knowledge_service/app.py && grep -q "three-part\|<repository>/<family>/<run>" README.md
 expect: exit 0
 
 id: TG3
 what: FENCE — only the deliverable paths changed
-run: cd /home/svend/knowledge-service && test -n "$(git status --porcelain)" && test -z "$(git status --porcelain | awk '{print $2}' | grep -v -E '^(knowledge_service/|scripts/|tests/|README.md|requirements-portable.txt)')"
+run: cd /home/svend/knowledge-service && test -n "$(git status --porcelain)" && test -z "$(git status --porcelain | awk '{print $2}' | grep -v -E '^(knowledge_service/|tests/|README.md|knowledge.ini.example)')"
 expect: exit 0
 
 id: TG4
-what: LIVE (reviewer only) — with the real ONNX model downloaded, the parity script builds dpmtf-webui with both providers and reports Jaccard@5 and latencies
-run: test -f /tmp/claude-1000/-home-svend-DPMtF-WebUI/e20394ae-27d0-4204-804f-5d6a2f5da054/scratchpad/a3-1-live/ok
+what: LIVE (reviewer only) — on 9140 the admitted artifact answers under dpmtf-webui/2000/040 after the migration and /v1/learning/drafts lists both repositories
+run: test -f /tmp/claude-1000/-home-svend-DPMtF-WebUI/e20394ae-27d0-4204-804f-5d6a2f5da054/scratchpad/a2-4-live/ok
 expect: exit 0
 ```
 
-## 4b. Correction 1 (reviewer, 2026-09-14 21:45Z) — the parity run inherits nothing and reports means per row
-
-Measured live with the real ONNX model on `dpmtf-webui` (five queries):
-the portable side built in 11.2 s and answered in ~230 ms per query; the
-LEANN side was reported `unavailable: free GPU memory 3613 MiB is below the
-configured minimum 4096 MiB`. This host runs a resident model, and the
-operator's `knowledge.ini` sets `min_free_vram_mib = 2500` for exactly that
-reason — `_write_ini` writes a run-scoped INI from scratch, so the
-operator's knowledge settings never reach the run. And every row shows
-`portable_ms = 231.8898139987141`: lines 212–213 put `_mean(latencies_ms)`
-into each row instead of that query's own latency. Required:
-
-1. `_write_ini` starts from the configured INI (the one `config` resolves
-   from `KNOWLEDGE_SERVICE_INI` or its default location; when none exists,
-   from the packaged defaults) and overrides only `[knowledge] provider`,
-   `[knowledge] index_dir` and `[service] db_path`; every other key —
-   `min_free_vram_mib`, `leann_use_daemon`, `top_k`, `max_context_tokens`,
-   `max_document_chars`, the `[portable]` section — carries over unchanged.
-   A new test, named exactly `test_parity_ini_inherits_the_operator_settings`
-   (in `tests/test_portable_readiness.py`), writes a base INI with
-   `min_free_vram_mib = 1234` and `leann_use_daemon = false`, points
-   `KNOWLEDGE_SERVICE_INI` at it, calls `_write_ini`, and asserts the
-   run-scoped INI carries both values and the three overrides.
-2. Each row's `leann_ms` / `portable_ms` is that query's own latency (the
-   i-th measurement); the summary keeps the means. A new test, named
-   exactly `test_parity_rows_carry_per_query_latencies`, drives the
-   report builder with two queries whose fake latencies differ and asserts
-   the two rows differ while the summary is their mean.
-3. TG1's named list gains the two tests (six names). Nothing else changes.
-
-Report as before with `git status` and TG1–TG3; the reviewer re-runs TG4.
-
-## 4c. Correction 2 (reviewer, 2026-09-14 22:00Z) — a provider that fails mid-run must be reported, not crash the run
-
-Measured live after correction 1: the operator settings now carry over
-(LEANN passed its preflight at 2500 MiB), the portable side built and
-answered, and then the LEANN build died with `torch.OutOfMemoryError:
-CUDA out of memory` (a resident model holds 26.7 GB; 953 MiB were free
-at the moment of the build) — and the whole script exited 1 with a
-traceback, losing the portable results. Required:
-
-1. A provider whose build or search raises after a passing preflight is
-   reported in the summary as `failed: <exception class>: <first line>`
-   with its columns empty, exactly like `unavailable`, and the other
-   provider's rows and summary still print; the exit code is 0 when at
-   least one provider completed and 2 when none did. A CUDA/GPU error is
-   not special-cased: any exception from `refresh_scope` or `search` of
-   one provider is that provider's failure.
-2. A new test, named exactly `test_parity_reports_a_provider_that_fails_during_build`
-   (stub LEANN provider whose `index` raises `RuntimeError("boom")` after a
-   passing preflight; the fake portable side completes; the JSON summary
-   carries `failed: RuntimeError: boom` for leann, the portable rows are
-   present, exit code 0).
-3. TG1's named list gains that test (seven names). Nothing else changes.
-
-Report as before with `git status` and TG1–TG3; the reviewer re-runs TG4
-when the GPU is free.
-
-## 4d. Correction 3 (reviewer, 2026-09-14 22:20Z) — the two builds share one index directory, so the second one is a noop
-
-Measured live after correction 2: LEANN was reported `failed:
-OutOfMemoryError …` as required, but the portable side then built in
-0.117 s and its store held 0 passages, so every portable row was empty
-(the first live run, where LEANN had failed at preflight before writing
-anything, gave five paths per query). Cause: both providers build into the
-same `--index-dir`; the LEANN attempt wrote the manifest
-`<index_dir>/dpmtf-webui.jsonl` before it died, and `refresh_scope` for
-the portable provider found an identical manifest on disk and returned
-`noop` without calling `provider.index`. Required:
-
-1. Each provider builds and searches in its own sub-directory —
-   `<index_dir>/leann/` and `<index_dir>/portable/` — with its own
-   run-scoped INI (`index_dir` and `db_path` inside that sub-directory),
-   so no manifest, store or registry is shared between the two builds and
-   neither provider's outcome can shadow the other's. `store_bytes` is
-   measured in the provider's own sub-directory.
-2. A new test, named exactly `test_parity_builds_each_provider_in_its_own_directory`
-   (stub LEANN whose `index` raises after the manifest exists, fake
-   portable completes; the portable store under `<index_dir>/portable/`
-   holds the manifest's passages and the rows are non-empty; the two
-   run-scoped INIs point at different `index_dir` values).
-3. TG1's named list gains that test (eight names). Nothing else changes.
-
-Report as before with `git status` and TG1–TG3; the reviewer re-runs TG4.
-
 ## 5. Initial Execution Instruction
 
-`init_project` with `reset: true`; goals for 2.1–2.3 in order; checkpoint
+`init_project` with `reset: true`; goals for 2.1–2.4 in order; checkpoint
 after each goal; ask now, in one message, only what is genuinely ambiguous;
 implement; run TG1–TG3 and `py_compile`; record coverage;
 `complete_project`; report `git status` and the pasted output of TG1–TG3.
-TG4 is the reviewer's (it downloads the model); do not attempt it, do not
-download anything and do not restart anything.
+TG4 is the reviewer's after the service restart; do not attempt it and do
+not restart anything.
