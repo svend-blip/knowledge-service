@@ -93,8 +93,8 @@ Testgoals green when the reviewer measures them; `git status` limited to
 
 ```testgoals
 id: TG1
-what: the six named readiness tests exist and pass and the whole suite is green
-run: cd /home/svend/knowledge-service && for t in package_imports_without_leann_torch_or_gpu portable_provider_paths_are_pathlib_and_no_posix_only_calls portable_build_and_search_round_trip_with_a_fake_embedder parity_script_reports_an_unavailable_provider_instead_of_raising parity_ini_inherits_the_operator_settings parity_rows_carry_per_query_latencies; do grep -q "def test_$t" tests/test_portable_readiness.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
+what: the seven named readiness tests exist and pass and the whole suite is green
+run: cd /home/svend/knowledge-service && for t in package_imports_without_leann_torch_or_gpu portable_provider_paths_are_pathlib_and_no_posix_only_calls portable_build_and_search_round_trip_with_a_fake_embedder parity_script_reports_an_unavailable_provider_instead_of_raising parity_ini_inherits_the_operator_settings parity_rows_carry_per_query_latencies parity_reports_a_provider_that_fails_during_build; do grep -q "def test_$t" tests/test_portable_readiness.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
 expect: exit 0
 
 id: TG2
@@ -144,6 +144,32 @@ into each row instead of that query's own latency. Required:
 3. TG1's named list gains the two tests (six names). Nothing else changes.
 
 Report as before with `git status` and TG1–TG3; the reviewer re-runs TG4.
+
+## 4c. Correction 2 (reviewer, 2026-09-14 22:00Z) — a provider that fails mid-run must be reported, not crash the run
+
+Measured live after correction 1: the operator settings now carry over
+(LEANN passed its preflight at 2500 MiB), the portable side built and
+answered, and then the LEANN build died with `torch.OutOfMemoryError:
+CUDA out of memory` (a resident model holds 26.7 GB; 953 MiB were free
+at the moment of the build) — and the whole script exited 1 with a
+traceback, losing the portable results. Required:
+
+1. A provider whose build or search raises after a passing preflight is
+   reported in the summary as `failed: <exception class>: <first line>`
+   with its columns empty, exactly like `unavailable`, and the other
+   provider's rows and summary still print; the exit code is 0 when at
+   least one provider completed and 2 when none did. A CUDA/GPU error is
+   not special-cased: any exception from `refresh_scope` or `search` of
+   one provider is that provider's failure.
+2. A new test, named exactly `test_parity_reports_a_provider_that_fails_during_build`
+   (stub LEANN provider whose `index` raises `RuntimeError("boom")` after a
+   passing preflight; the fake portable side completes; the JSON summary
+   carries `failed: RuntimeError: boom` for leann, the portable rows are
+   present, exit code 0).
+3. TG1's named list gains that test (seven names). Nothing else changes.
+
+Report as before with `git status` and TG1–TG3; the reviewer re-runs TG4
+when the GPU is free.
 
 ## 5. Initial Execution Instruction
 
