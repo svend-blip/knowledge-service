@@ -95,6 +95,16 @@ itself (`~/DPMtF-WebUI/databases/dpmtf.db`) so its `dpmtf.db-wal` sibling is
 read along with it; a copy of only the main file can miss the most recent
 commits, including freshly recorded grants.
 
+Every `/v1/search` that reaches a provider appends one
+`knowledge_retrieval_log` row with `provider`, `scope`, `query`,
+`result_count`, `sources`, `retrieved_token_count`,
+`retrieval_duration_ms`, `agent_role`, `run_id`, `handoff_id`, `flow_key` and
+`created_at`. `flow_key` is the caller's flow key (nullable): the same value
+the scope guard matched, so retrievals are auditable per workspace. A database
+created before that column existed gains it on the next start — `ensure_schema`
+adds it in place and keeps the existing rows — and rows imported from such a
+database simply have a NULL there.
+
 Grant internal scopes to the roles that may read them (public scopes need no
 grant). A database whose grant table is still empty starts with one baseline
 grant — the configured default scope for this installation's supervisor role

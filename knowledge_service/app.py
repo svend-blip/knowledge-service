@@ -99,8 +99,9 @@ def search_knowledge(
     Disabled mode (enabled false, or configured provider ``none``) returns
     the stable disabled envelope and writes no log row. Enabled mode resolves
     the configured provider, searches it, and appends one retrieval-log row.
-    ``flow_key`` is passed to the scope guard for grant matching and is not
-    recorded in the retrieval log. ``top_k`` and ``token_budget`` fall back
+    ``flow_key`` is both matched against the grants by the scope guard and
+    stored on the logged row, so retrievals are auditable per flow.
+    ``top_k`` and ``token_budget`` fall back
     to the configured values and are then clamped to the configured ceilings,
     so a caller may lower them but never raise them; the returned list is
     still defensively truncated to ``top_k``.
@@ -164,6 +165,7 @@ def search_knowledge(
         agent_role=agent_role,
         run_id=run_id,
         handoff_id=handoff_id,
+        flow_key=flow_key,
     )
 
     return {

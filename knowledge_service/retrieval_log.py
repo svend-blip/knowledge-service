@@ -32,8 +32,14 @@ def record_retrieval(
     agent_role: str | None,
     run_id: str | None,
     handoff_id: str | None,
+    flow_key: str | None = None,
 ) -> None:
     """Append one ``knowledge_retrieval_log`` row for a real retrieval.
+
+    ``flow_key`` is the caller's flow key (nullable): it makes the retrieval
+    auditable per workspace without a second query join. The remaining columns
+    are the provider key, scope, query, result count, JSON source list,
+    retrieved token count, duration, agent role, run id and handoff id.
 
     Parameterized SQL only (``?`` placeholders, never string concatenation).
     A database failure is logged and surfaced to the caller as a 500 rather
@@ -49,8 +55,8 @@ def record_retrieval(
             "INSERT INTO knowledge_retrieval_log "
             "(provider, scope, query, result_count, sources, "
             "retrieved_token_count, retrieval_duration_ms, "
-            "agent_role, run_id, handoff_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "agent_role, run_id, handoff_id, flow_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 provider,
                 scope or "",
@@ -62,6 +68,7 @@ def record_retrieval(
                 agent_role,
                 run_id,
                 handoff_id,
+                flow_key,
             ),
         )
         conn.commit()

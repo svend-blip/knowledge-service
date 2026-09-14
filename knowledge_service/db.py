@@ -8,12 +8,16 @@ one-time ``import-registry`` can copy rows straight across:
 * ``knowledge_indexes``       per-scope index registry (migration 107, with
                               migration 110's status triggers).
 * ``knowledge_exclusions``    repository-specific exclusion rules (107).
-* ``knowledge_retrieval_log`` append-only retrieval history (107).
+* ``knowledge_retrieval_log`` append-only retrieval history (107, plus run
+                              034's nullable ``flow_key``, which records the
+                              caller's flow key for per-workspace auditing).
 * ``knowledge_scope_grants``  explicit grants for internal scopes (109).
 
 Every statement is idempotent (``IF NOT EXISTS``), so ``connect()`` can be
-called from any entry point without a migration step. Parameterized SQL
-only everywhere else in the package.
+called from any entry point without a migration step. ``ensure_schema`` also
+adds ``flow_key`` to an older retrieval-log table in place, so a database from
+before run 034 keeps working and keeps its rows. Parameterized SQL only
+everywhere else in the package.
 
 A database whose grant table is still empty gets one baseline grant: the
 configured default scope for this installation's supervisor role, with no
@@ -81,7 +85,11 @@ CREATE TABLE IF NOT EXISTS knowledge_retrieval_log (
     agent_role            TEXT,
     run_id                TEXT,
     handoff_id            TEXT,
-    created_at            TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    -- Added after ``handoff_id`` (run 034). It stays last so an older database
+    -- upgraded with ``ALTER TABLE ... ADD COLUMN`` ends up in the same column
+    -- order as one created here; see ``_upgrade_retrieval_log``.
+    flow_key              TEXT DEFAULT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_knowledge_retrieval_log_scope_time
@@ -127,9 +135,34 @@ REGISTRY_TABLES = (
 )
 
 
+def _upgrade_retrieval_log(conn: sqlite3.Connection) -> None:
+    """Add ``flow_key`` to a retrieval log created before that column existed.
+
+    A database written by the 3A-1 schema has the table without ``flow_key``.
+    ``CREATE TABLE IF NOT EXISTS`` leaves such a table untouched, so the
+    missing column is detected through ``pragma table_info`` and added in
+    place; existing rows keep their values and read back with a NULL
+    ``flow_key``. Detection by column name (not by a version stamp) means the
+    upgrade is a no-op on any database that already has the column.
+    """
+    columns = [row[1] for row in conn.execute(
+        "PRAGMA table_info(knowledge_retrieval_log)"
+    ).fetchall()]
+    if not columns:
+        # No table at all in this database: the statements above created it
+        # with the column already present.
+        return None
+    if "flow_key" not in columns:
+        conn.execute(
+            "ALTER TABLE knowledge_retrieval_log ADD COLUMN flow_key TEXT DEFAULT NULL"
+        )
+    return None
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create the four knowledge tables when they are still missing."""
+    """Create the four knowledge tables and upgrade the retrieval log."""
     conn.executescript(SCHEMA_SQL)
+    _upgrade_retrieval_log(conn)
     conn.commit()
     return None
 

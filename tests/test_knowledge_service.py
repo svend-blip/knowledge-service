@@ -657,3 +657,165 @@ def test_package_never_imports_dpmtf():
             assert module.__name__ == name
     finally:
         sys.path[:] = saved
+
+
+# ── retrieval-log flow key (run 034 parity) ─────────────────────────────
+
+
+_OLD_LOG_TABLE = """
+CREATE TABLE knowledge_retrieval_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    query TEXT NOT NULL,
+    result_count INTEGER NOT NULL DEFAULT 0,
+    sources TEXT NOT NULL DEFAULT '[]',
+    retrieved_token_count INTEGER NOT NULL DEFAULT 0,
+    retrieval_duration_ms INTEGER NOT NULL DEFAULT 0,
+    agent_role TEXT,
+    run_id TEXT,
+    handoff_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+
+def _log_columns(conn: sqlite3.Connection) -> list:
+    return [row[1] for row in conn.execute(
+        "pragma table_info(knowledge_retrieval_log)"
+    ).fetchall()]
+
+
+def test_schema_has_flow_key_and_upgrades_an_older_database(tmp_path, monkeypatch):
+    """Fresh databases get the column; a pre-run-034 file is upgraded."""
+    write_ini(tmp_path, monkeypatch, service_ini(tmp_path, monkeypatch))
+
+    fresh = sqlite3.connect(tmp_path / "fresh.db")
+    db.ensure_schema(fresh)
+    columns = _log_columns(fresh)
+    # Column order matters for schema parity with the shared databases: the
+    # column is appended last, exactly where ALTER TABLE puts it.
+    assert columns[-1] == "flow_key"
+    assert columns.index("handoff_id") < columns.index("flow_key")
+    fresh.close()
+
+    # An older file: table without the column, holding one row.
+    old = sqlite3.connect(tmp_path / "old.db")
+    old.executescript(_OLD_LOG_TABLE)
+    old.execute(
+        "INSERT INTO knowledge_retrieval_log (provider, scope, query, result_count)"
+        " VALUES ('leann', 'flowrunner', 'budget', 3)"
+    )
+    old.commit()
+
+    db.ensure_schema(old)
+
+    assert _log_columns(old)[-1] == "flow_key"
+    rows = old.execute(
+        "SELECT query, result_count, flow_key FROM knowledge_retrieval_log"
+    ).fetchall()
+    # Existing rows survive and read back with a NULL flow key.
+    assert [(row[0], row[1], row[2]) for row in rows] == [("budget", 3, None)]
+
+    # The upgrade is a no-op the second time around.
+    db.ensure_schema(old)
+    assert _log_columns(old)[-1] == "flow_key"
+    assert old.execute(
+        "SELECT COUNT(*) FROM knowledge_retrieval_log"
+    ).fetchone()[0] == 1
+    old.close()
+
+
+def test_search_route_records_the_flow_key(tmp_path, monkeypatch):
+    install_stub(monkeypatch)
+    stub_torch(monkeypatch)
+    write_ini(tmp_path, monkeypatch, service_ini(tmp_path, monkeypatch))
+    client = make_client()
+
+    response = client.get(
+        "/v1/search",
+        params={
+            "q": "budget",
+            "scope": "flowrunner",
+            "agent_role": "dsh",
+            "run_id": "034",
+            "flow_key": "9000-01-PLOOP",
+        },
+    )
+    assert response.status_code == 200
+
+    rows = log_rows()
+    assert len(rows) == 1
+    assert rows[0]["flow_key"] == "9000-01-PLOOP"
+    assert rows[0]["run_id"] == "034"
+
+    # Without the parameter the column stays NULL, not an empty string.
+    assert client.get(
+        "/v1/search", params={"q": "budget", "scope": "flowrunner"}
+    ).status_code == 200
+    rows = log_rows()
+    assert len(rows) == 2
+    assert rows[1]["flow_key"] is None
+
+
+def _source_with_flow_key(tmp_path) -> str:
+    """Source database in the post-run-034 shape (column present)."""
+    source = tmp_path / "with-flow-key.db"
+    conn = sqlite3.connect(source)
+    conn.executescript(db.SCHEMA_SQL)
+    conn.execute(
+        "INSERT INTO knowledge_retrieval_log"
+        " (provider, scope, query, result_count, flow_key)"
+        " VALUES ('leann', 'flowrunner', 'budget', 3, '9000-01-PLOOP')"
+    )
+    conn.execute(
+        "INSERT INTO knowledge_retrieval_log"
+        " (provider, scope, query, result_count, flow_key)"
+        " VALUES ('leann', 'flowrunner', 'exclusions', 1, NULL)"
+    )
+    conn.commit()
+    conn.close()
+    return str(source)
+
+
+def _source_without_flow_key(tmp_path) -> str:
+    """Source database from before run **034** (column absent)."""
+    source = tmp_path / "before-034.db"
+    conn = sqlite3.connect(source)
+    conn.executescript(_OLD_LOG_TABLE)
+    conn.execute(
+        "INSERT INTO knowledge_retrieval_log (provider, scope, query, result_count)"
+        " VALUES ('leann', 'flowrunner', 'legacy', 2)"
+    )
+    conn.commit()
+    conn.close()
+    return str(source)
+
+
+def _imported_log_rows() -> list:
+    conn = db.connect()
+    try:
+        return conn.execute(
+            "SELECT query, flow_key FROM knowledge_retrieval_log ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_import_registry_copies_flow_key_when_present(tmp_path, monkeypatch):
+    # One fresh target per source: the import keeps original ids, so rows from
+    # two sources would otherwise compete on id.
+    write_ini(
+        tmp_path, monkeypatch, service_ini(tmp_path, monkeypatch, db_path=str(tmp_path / "after.db"))
+    )
+    assert cli.main(["import-registry", "--from", _source_with_flow_key(tmp_path)]) == 0
+    rows = {row[0]: row[1] for row in _imported_log_rows()}
+    assert rows == {"budget": "9000-01-PLOOP", "exclusions": None}
+
+    # A source from before run 034 has no column to copy: its row arrives with
+    # a NULL flow key instead of an invented one.
+    write_ini(
+        tmp_path, monkeypatch, service_ini(tmp_path, monkeypatch, db_path=str(tmp_path / "before.db"))
+    )
+    assert cli.main(["import-registry", "--from", _source_without_flow_key(tmp_path)]) == 0
+    assert {row[0]: row[1] for row in _imported_log_rows()} == {"legacy": None}
