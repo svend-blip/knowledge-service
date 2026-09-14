@@ -111,7 +111,7 @@ Testgoals green when the reviewer measures them; `git status` limited to
 ```testgoals
 id: TG1
 what: the six named tests exist and pass and the whole suite is green
-run: cd /home/svend/knowledge-service && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests -k "portable_index_search_roundtrip_with_fake_embedder or portable_update_replaces_and_remove_deletes or portable_scope_filter_and_token_budget or portable_preflight_reports_missing_model or resolve_provider_binds_portable_store_path or provider_contract_is_shared or onnx_embedder_pools_a_realistic_session_output" 2>&1 | tail -n 1 | grep -E "^[7-9] passed|^[1-9][0-9] passed" && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
+run: cd /home/svend/knowledge-service && grep -q "def test_onnx_embedder_pools_a_realistic_session_output" tests/test_knowledge_service.py && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests -k "portable_index_search_roundtrip_with_fake_embedder or portable_update_replaces_and_remove_deletes or portable_scope_filter_and_token_budget or portable_preflight_reports_missing_model or resolve_provider_binds_portable_store_path or provider_contract_is_shared or onnx_embedder_pools_a_realistic_session_output" 2>&1 | tail -n 1 | grep -E "^[7-9] passed|^[1-9][0-9] passed" && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
 expect: exit 0
 
 id: TG2
