@@ -161,7 +161,7 @@ expect: exit 0
 
 id: TG3
 what: no module in the package imports DPMtF
-run: cd /home/svend/knowledge-service && ! grep -rn -E "^(import config|from config import|import bridge_lib|from bridge_lib|from knowledge import|import knowledge\.)" knowledge_service/ && ! grep -rn "DPMtF-WebUI" knowledge_service/
+run: cd /home/svend/knowledge-service && test -d knowledge_service && test -f knowledge_service/app.py && ! grep -rn -E "^(import config|from config import|import bridge_lib|from bridge_lib|from knowledge import|import knowledge\.)" knowledge_service/ && ! grep -rn "DPMtF-WebUI" knowledge_service/
 expect: exit 0
 
 id: TG4
