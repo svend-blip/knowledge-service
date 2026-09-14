@@ -19,9 +19,11 @@ whose build or search raises after a passing preflight is reported as
 ``failed: <exception class>: <first line>``, also with empty columns, and
 the other provider's rows and summary still print. The script never raises
 for either; it exits 0 when at least one provider completed and 2 when none
-did. Everything is written under ``--index-dir`` (a temp directory by
-default): manifests, both stores and the temp registry database. The shared
-index directory and the real registry are never touched.
+did. Everything is written under ``--index-dir`` (a temp directory by default):
+each provider builds and searches in its own sub-directory — manifest,
+store and temp registry — so neither build can shadow the other through a
+shared manifest. The shared index directory and the real registry are never
+touched.
 
 Usage::
 
@@ -145,7 +147,12 @@ def _run_provider(
         "unavailable": None,
         "failed": None,
     }
-    _write_ini(index_dir, provider_key)
+    # Each provider gets its own sub-directory: manifest, store and registry
+    # are never shared, so the first provider's manifest cannot turn the
+    # second provider's build into a noop.
+    store_dir = index_dir / provider_key
+    store_dir.mkdir(parents=True, exist_ok=True)
+    _write_ini(store_dir, provider_key)
 
     started = time.perf_counter()
     try:
@@ -178,7 +185,7 @@ def _run_provider(
         outcome["top"] = {query: [] for query in queries}
         outcome["latency_ms"] = {}
 
-    outcome["store_bytes"] = _store_size_bytes(index_dir, scope)
+    outcome["store_bytes"] = _store_size_bytes(store_dir, scope)
     return outcome
 
 

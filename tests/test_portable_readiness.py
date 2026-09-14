@@ -1,6 +1,6 @@
 """Windows-readiness proofs for the portable provider path.
 
-Six named proofs, runnable wherever Python and the portable requirements
+Seven named proofs, runnable wherever Python and the portable requirements
 run (hermetic: temporary directories only, fake embedders, no network):
 
 1. the package imports and builds its app without ``leann``,
@@ -16,7 +16,9 @@ run (hermetic: temporary directories only, fake embedders, no network):
 6. each parity row carries that query's own latency, and the summary the
    mean across queries;
 7. a provider whose build raises after a passing preflight is reported as
-   ``failed``, the other provider still completes, and the exit code is 0.
+   ``failed``, the other provider still completes, and the exit code is 0;
+8. each provider builds into its own sub-directory under the index dir, so
+   neither build can shadow the other's manifest.
 """
 
 from __future__ import annotations
@@ -205,7 +207,7 @@ def test_parity_script_reports_an_unavailable_provider_instead_of_raising(
         if name == "leann"
         else partial(
             PortableProvider,
-            index_path=str(index_dir / f"{scope}.portable.db"),
+            index_path=str(index_dir / "portable" / f"{scope}.portable.db"),
             embedder=ReadinessEmbedder(),
         ),
     )
@@ -408,4 +410,80 @@ def test_parity_reports_a_provider_that_fails_during_build(
     assert len(rows) == 2
     assert all(row["portable_top"] == ["notes.md"] for row in rows)
     assert all(row["leann_top"] == [] for row in rows)
+
+
+def test_parity_builds_each_provider_in_its_own_directory(tmp_path, monkeypatch):
+    """Each provider gets its own sub-directory; no shared manifest, no noop."""
+
+    seen: dict = {}
+
+    class BuildFailLeann:
+        def __init__(self, **kwargs):
+            pass
+
+        def preflight(self):
+            return None
+
+        def index(self, source):
+            # Reached only after the indexer wrote the manifest; record it
+            # and die, so only the portable sub-directory can still build.
+            seen["leann_manifest"] = str(source)
+            raise RuntimeError("boom")
+
+        def update(self, source):
+            raise RuntimeError("boom")
+
+        def remove(self, source):
+            return None
+
+        def search(self, query, *, scope=None, filters=None, top_k=None,
+                   token_budget=None):
+            return []
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "notes.md").write_text("# Notes\nalpha bravo bridge\n", encoding="utf-8")
+
+    index_dir = tmp_path / "index"
+    monkeypatch.setattr(
+        search,
+        "resolve_provider",
+        lambda name, scope=None: BuildFailLeann
+        if name == "leann"
+        else partial(
+            PortableProvider,
+            index_path=str(index_dir / "portable" / f"{scope}.portable.db"),
+            embedder=ReadinessEmbedder(),
+        ),
+    )
+
+    parity = _parity_module()
+    report = parity.parity_report(
+        "alpha", str(repo), ["alpha"], index_dir=index_dir, top_k=2
+    )
+
+    # The portable side built its own store in its own sub-directory and
+    # answered, even though the LEANN attempt died mid-build.
+    rows = report["rows"]
+    assert rows[0]["portable_top"] == ["notes.md"]
+    assert rows[0]["leann_top"] == []
+    assert report["summary"]["providers"]["leann"]["failed"] == "RuntimeError: boom"
+    assert report["summary"]["providers"]["portable"]["store_bytes"] > 0
+    assert (index_dir / "portable" / "alpha.portable.db").is_file()
+
+    # Each provider's manifest and run-scoped INI sit in its own directory.
+    leann_manifest = Path(seen["leann_manifest"])
+    assert leann_manifest.is_file()
+    assert leann_manifest.parent == index_dir / "leann"
+    assert (index_dir / "portable" / "alpha.jsonl").is_file()
+
+    leann_ini = configparser.ConfigParser()
+    leann_ini.read(index_dir / "leann" / "parity-leann.ini", encoding="utf-8")
+    portable_ini = configparser.ConfigParser()
+    portable_ini.read(index_dir / "portable" / "parity-portable.ini", encoding="utf-8")
+    assert leann_ini.get("knowledge", "index_dir") == str(index_dir / "leann")
+    assert portable_ini.get("knowledge", "index_dir") == str(index_dir / "portable")
+    assert leann_ini.get("service", "db_path") != portable_ini.get(
+        "service", "db_path"
+    )
 
