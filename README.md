@@ -367,3 +367,54 @@ normalisation itself already works for both styles through the slug rule in
 `knowledge_service/scopes.py`. The `portable` provider above is the part that
 drops the compiled backend and the CUDA dependency, so a Windows host runs the
 same service with `provider = portable` and needs no GPU.
+
+The exact sequence a fresh Windows machine runs:
+
+```bat
+py -3.12 -m venv venv
+venv\Scripts\pip install -r requirements-portable.txt
+venv\Scripts\python -m knowledge_service.cli download-model
+notepad %USERPROFILE%\.config\knowledge-service\knowledge.ini
+rem   in the editor: enabled = true, provider = portable
+venv\Scripts\python -m knowledge_service.cli refresh flowrunner C:\Projects\FlowRunner
+curl "http://127.0.0.1:9140/v1/search?q=runtime+child&scope=flowrunner"
+```
+
+`download-model` fetches the ONNX files the portable provider reads
+(`onnx/model.onnx`, `tokenizer.json` and the small config files), needs a
+network once, and prints the model directory. `requirements-portable.txt`
+lists exactly what the portable path imports — `fastapi`, `uvicorn`,
+`pydantic`, `PyYAML`, and the lazily imported `onnxruntime`, `tokenizers` and
+`numpy` — plus `pytest` and `httpx` so the readiness tests run from one
+install. `leann`, the compiled LEANN backends and `torch` are not installed on
+that machine and the package must not require them: everything above the
+provider boundary works without them, which is what
+`tests/test_portable_readiness.py` proves.
+
+## Parity
+
+`scripts/provider_parity.py` builds one scope twice into a temporary index
+directory — once with the `leann` provider, once with `portable`, both
+through the package's own maintenance path — and runs every query line of a
+file against both stores:
+
+```sh
+python scripts/provider_parity.py --scope flowrunner \
+    --repo ~/FlowRunner --queries queries.txt [--index-dir tmp] [--top-k 5] [--json]
+```
+
+One table row per query (`query`, `leann_top`, `portable_top`, `jaccard@k`,
+`leann_ms`, `portable_ms`) plus a summary line with the mean Jaccard, the mean
+answer latency, the build seconds and the store size per provider; `--json`
+prints the same data as one JSON document. Everything is written under
+`--index-dir` (default a fresh `mkdtemp`), never into the shared index
+directory or the registry database.
+
+Reading `jaccard@k`: the fraction of shared result paths in the two top-`k`
+lists — `1.0` means the providers answered with the same files, values around
+`0.6–0.8` mean the heads agree and only the tail differs, below `0.5` the two
+providers genuinely disagree on that query and the wording of the query is
+worth a look. A provider whose preflight fails (no GPU, no model files) shows
+up in the summary as `unavailable: <detail>` with its columns empty; the
+script itself never fails for that.
+

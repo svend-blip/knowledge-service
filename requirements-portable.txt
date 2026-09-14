@@ -1,0 +1,17 @@
+# Portable-path requirements for a fresh Windows (or GPU-less) install.
+# Derived from the imports of the modules the service loads with
+# provider = portable: knowledge_service.app/-cli/-learning/-maintenance
+# (fastapi, pydantic via fastapi, yaml via learning, uvicorn served by cli),
+# knowledge_service.portable_provider (onnxruntime, tokenizers, numpy, all
+# imported lazily), plus pytest and httpx so the readiness tests run from one
+# install (tests use fastapi.testclient). leann, the compiled LEANN backends
+# and torch are NOT needed by this path and deliberately absent.
+fastapi==0.110.0
+uvicorn==0.29.0
+pydantic==2.13.4
+PyYAML==6.0.3
+onnxruntime==1.30.0
+numpy==1.26.4
+tokenizers==0.22.2
+pytest==8.3.4
+httpx==0.27.2
