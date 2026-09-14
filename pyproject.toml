@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knowledge-service"
+version = "1.0.0"
+description = "Standalone provider-neutral knowledge retrieval service (the extracted DPMtF knowledge layer)."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.110.0",
+    "uvicorn==0.29.0",
+    "pydantic==2.13.4",
+    "leann==0.3.7",
+    "leann-core==0.3.7",
+    "leann-backend-hnsw==0.3.7",
+    "leann-backend-diskann==0.3.7",
+    "torch==2.14.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest==8.3.4", "httpx==0.27.2"]
+
+[tool.setuptools]
+packages = ["knowledge_service"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

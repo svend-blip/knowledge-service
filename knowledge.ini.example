@@ -1,0 +1,37 @@
+# knowledge.ini — standalone knowledge service configuration.
+#
+# Install at ~/.config/knowledge-service/knowledge.ini, or point the
+# environment variable KNOWLEDGE_SERVICE_INI at this file. A missing file is
+# fine: every key falls back to the default shown here. Copy to
+# ~/.config/knowledge-service/knowledge.ini and adjust.
+
+[knowledge]
+# Retrieval on/off. Keep false while a resident local model holds the GPU.
+enabled = true
+# none (no-op) or leann. Unknown keys behave like none.
+provider = leann
+# Default scope of this installation: the scope of father_root below.
+scope = dpmtf-webui
+# Result count and context budget for searches without explicit bounds.
+top_k = 8
+max_context_tokens = 12000
+# Characters kept from one indexed document; longer ones are truncated.
+max_document_chars = 20000
+# Shared index directory, outside every repository (relative = under ~).
+index_dir = ~/.local/share/dpmtf/knowledge_index
+# Free GPU memory required before a search or index run is allowed.
+min_free_vram_mib = 4096
+# hnsw daemon is usually not worth it; keep search in-process.
+leann_use_daemon = false
+
+[service]
+# Listening address of this service.
+host = 127.0.0.1
+port = 9140
+# This service's own SQLite database (relative = under ~).
+db_path = ~/.local/share/knowledge-service/knowledge.db
+# Shared token for the X-Knowledge-Token header. Empty means no auth,
+# which is right for localhost; set it when exposing over Tailscale.
+token =
+# Repository whose scope is the default scope above (empty = no mapping).
+father_root = /home/svend/DPMtF-WebUI

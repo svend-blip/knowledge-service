@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily knowledge index refresh (only when preflight passes)
+
+[Service]
+Type=oneshot
+Environment=KNOWLEDGE_SERVICE_INI=%h/.config/knowledge-service/knowledge.ini
+# refresh-all keeps whatever the registry records and skips scopes whose
+# repository path is gone; a failing preflight costs no repository scan.
+ExecStart=%h/knowledge-service/venv/bin/python -m knowledge_service.cli refresh-all --from-registry
+Nice=10

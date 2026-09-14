@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily refresh for the standalone knowledge service
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+# Refresh only makes sense when a search would also be allowed to run;
+# the refresh unit's preflight gate handles the busy-GPU case.
+
+[Install]
+WantedBy=timers.target
