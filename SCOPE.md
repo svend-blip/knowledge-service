@@ -93,8 +93,8 @@ Testgoals green when the reviewer measures them; `git status` limited to
 
 ```testgoals
 id: TG1
-what: the four named readiness tests exist and pass and the whole suite is green
-run: cd /home/svend/knowledge-service && for t in package_imports_without_leann_torch_or_gpu portable_provider_paths_are_pathlib_and_no_posix_only_calls portable_build_and_search_round_trip_with_a_fake_embedder parity_script_reports_an_unavailable_provider_instead_of_raising; do grep -q "def test_$t" tests/test_portable_readiness.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
+what: the six named readiness tests exist and pass and the whole suite is green
+run: cd /home/svend/knowledge-service && for t in package_imports_without_leann_torch_or_gpu portable_provider_paths_are_pathlib_and_no_posix_only_calls portable_build_and_search_round_trip_with_a_fake_embedder parity_script_reports_an_unavailable_provider_instead_of_raising parity_ini_inherits_the_operator_settings parity_rows_carry_per_query_latencies; do grep -q "def test_$t" tests/test_portable_readiness.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
 expect: exit 0
 
 id: TG2
@@ -112,6 +112,38 @@ what: LIVE (reviewer only) — with the real ONNX model downloaded, the parity s
 run: test -f /tmp/claude-1000/-home-svend-DPMtF-WebUI/e20394ae-27d0-4204-804f-5d6a2f5da054/scratchpad/a3-1-live/ok
 expect: exit 0
 ```
+
+## 4b. Correction 1 (reviewer, 2026-09-14 21:45Z) — the parity run inherits nothing and reports means per row
+
+Measured live with the real ONNX model on `dpmtf-webui` (five queries):
+the portable side built in 11.2 s and answered in ~230 ms per query; the
+LEANN side was reported `unavailable: free GPU memory 3613 MiB is below the
+configured minimum 4096 MiB`. This host runs a resident model, and the
+operator's `knowledge.ini` sets `min_free_vram_mib = 2500` for exactly that
+reason — `_write_ini` writes a run-scoped INI from scratch, so the
+operator's knowledge settings never reach the run. And every row shows
+`portable_ms = 231.8898139987141`: lines 212–213 put `_mean(latencies_ms)`
+into each row instead of that query's own latency. Required:
+
+1. `_write_ini` starts from the configured INI (the one `config` resolves
+   from `KNOWLEDGE_SERVICE_INI` or its default location; when none exists,
+   from the packaged defaults) and overrides only `[knowledge] provider`,
+   `[knowledge] index_dir` and `[service] db_path`; every other key —
+   `min_free_vram_mib`, `leann_use_daemon`, `top_k`, `max_context_tokens`,
+   `max_document_chars`, the `[portable]` section — carries over unchanged.
+   A new test, named exactly `test_parity_ini_inherits_the_operator_settings`
+   (in `tests/test_portable_readiness.py`), writes a base INI with
+   `min_free_vram_mib = 1234` and `leann_use_daemon = false`, points
+   `KNOWLEDGE_SERVICE_INI` at it, calls `_write_ini`, and asserts the
+   run-scoped INI carries both values and the three overrides.
+2. Each row's `leann_ms` / `portable_ms` is that query's own latency (the
+   i-th measurement); the summary keeps the means. A new test, named
+   exactly `test_parity_rows_carry_per_query_latencies`, drives the
+   report builder with two queries whose fake latencies differ and asserts
+   the two rows differ while the summary is their mean.
+3. TG1's named list gains the two tests (six names). Nothing else changes.
+
+Report as before with `git status` and TG1–TG3; the reviewer re-runs TG4.
 
 ## 5. Initial Execution Instruction
 
