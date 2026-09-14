@@ -133,6 +133,25 @@ The service is a `simple` unit; the timer runs `refresh-all --from-registry`
 daily, and both units are `Nice=10` so retrieval never competes with a local
 model for the GPU.
 
+## Running the tests
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 ./venv/bin/python -m pytest -q tests
+```
+
+Every test runs isolated from the operator's files. An autouse fixture in
+`tests/conftest.py` points `KNOWLEDGE_SERVICE_INI` at a temporary INI whose
+`db_path` and `index_dir` are inside pytest's own `tmp_path`, so registry rows,
+grants and retrieval-log rows can only land in that temporary database — and
+because the config loader re-reads that variable on every call, the value the
+fixture set is what the code sees. At teardown the same fixture compares the
+size and modification time of every file under
+`~/.local/share/knowledge-service/` and under the shared index directory with
+the snapshot taken before the test ran, and fails with the offending path in
+the message when something changed there. A test that writes outside its
+temporary directories therefore fails loudly instead of quietly leaving rows in
+the live service database.
+
 ## GPU requirement
 
 Copied from DPMtF's `docs/knowledge_indexing.md` ("GPU requirement"):

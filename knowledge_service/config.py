@@ -6,7 +6,9 @@ first existing candidate is ``~/.config/knowledge-service/knowledge.ini``
 and the last is ``./knowledge.ini`` in the current working directory. A
 missing file is not an error: every getter has the default its key had in
 DPMtF's ``[knowledge]`` section, so the service runs on a bare host with no
-INI at all.
+INI at all. The environment is consulted on every getter call, so changing
+``KNOWLEDGE_SERVICE_INI`` takes effect immediately — a test can point the whole
+service at its own temporary directories at any point.
 
 The ``[knowledge]`` keys and defaults are the ones DPMtF carries today
 (enabled/provider/scope/top_k/max_context_tokens/max_document_chars/
@@ -51,6 +53,7 @@ _INDEX_DIR_DEFAULT = ".local/share/dpmtf/knowledge_index"
 _DB_PATH_DEFAULT = ".local/share/knowledge-service/knowledge.db"
 
 _PARSER: ConfigParser | None = None
+_LOADED_ENV: str | None = None
 _SOURCE: str = ""
 
 
@@ -65,11 +68,28 @@ def _candidate_paths() -> list[Path]:
     return candidates
 
 
+def _current_env() -> str:
+    """The value of the INI-path variable right now (``""`` when unset)."""
+    return os.environ.get(ENV_INI_PATH, "").strip()
+
+
 def _parser() -> ConfigParser:
-    """Return the loaded parser, loading it on first use."""
-    global _PARSER
-    if _PARSER is None:
+    """Return the loaded parser, reloading it whenever the env changed.
+
+    The parser is cached, but the cache belongs to the environment value it was
+    loaded under. When ``KNOWLEDGE_SERVICE_INI`` changes — a second test, a new
+    process environment, a supervisor pointing at another installation — the
+    next getter call re-reads instead of continuing to serve the previous
+    caller's paths. Without that check the first getter call in a process would
+    pin every later one to whichever INI happened to exist at that moment, and
+    a test that isolated itself afterwards would still write into the
+    operator's database. ``reload()`` stays available for an explicit drop.
+    """
+    global _PARSER, _LOADED_ENV
+    env = _current_env()
+    if _PARSER is None or env != _LOADED_ENV:
         _PARSER = _load()
+        _LOADED_ENV = env
     return _PARSER
 
 
@@ -91,9 +111,14 @@ def _load() -> ConfigParser:
 
 
 def reload() -> None:
-    """Drop the cached parser so the next getter call re-reads the INI."""
-    global _PARSER
+    """Drop the cached parser so the next getter call re-reads the INI.
+
+    Only needed when the INI *file* changed under an unchanged environment; a
+    different ``KNOWLEDGE_SERVICE_INI`` value is picked up automatically.
+    """
+    global _PARSER, _LOADED_ENV
     _PARSER = None
+    _LOADED_ENV = None
     return None
 
 

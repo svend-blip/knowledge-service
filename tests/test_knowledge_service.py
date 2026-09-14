@@ -8,9 +8,11 @@ requires a running service or a GPU.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import types
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -19,6 +21,7 @@ from knowledge_service.app import create_app
 from knowledge_service.provider import ProviderNotReady
 from knowledge_service.scopes import scope_for_path
 from knowledge_service import search as search_module
+from tests.conftest import OPERATOR_DIRS, changed_entries, snapshot_tree
 
 # ── helpers ─────────────────────────────────────────────────────────────
 
@@ -819,3 +822,92 @@ def test_import_registry_copies_flow_key_when_present(tmp_path, monkeypatch):
     )
     assert cli.main(["import-registry", "--from", _source_without_flow_key(tmp_path)]) == 0
     assert {row[0]: row[1] for row in _imported_log_rows()} == {"legacy": None}
+
+
+# ── isolation of operator storage ───────────────────────────────────────
+
+
+def test_registry_rows_land_in_the_test_database_only(tmp_path, monkeypatch):
+    """Registry writes go to the per-test database, not the operator's file."""
+    write_ini(tmp_path, monkeypatch, service_ini(tmp_path, monkeypatch))
+
+    maintenance.record_index("alpha", "leann", str(tmp_path / "alpha"), 3, "changed")
+    maintenance.record_index("beta", "leann", str(tmp_path / "beta"), 0, "missing")
+
+    test_db = Path(config.get_db_path())
+    assert str(test_db).startswith(str(tmp_path))
+
+    conn = sqlite3.connect(test_db)
+    try:
+        rows = dict(conn.execute(
+            "select scope, document_count from knowledge_indexes order by scope"
+        ))
+    finally:
+        conn.close()
+    assert rows == {"alpha": 3, "beta": 0}
+
+    # The operator's own file is a different location and is never consulted:
+    # the resolved path came from the INI this test wrote.
+    operator_db = Path.home() / ".local/share/knowledge-service/knowledge.db"
+    assert test_db != operator_db
+
+
+def test_config_rereads_the_ini_env_on_every_call(tmp_path, monkeypatch):
+    """A changed KNOWLEDGE_SERVICE_INI is honoured without an explicit reload."""
+    first = tmp_path / "first.ini"
+    first.write_text(
+        "[knowledge]\nindex_dir = %s\n\n[service]\ndb_path = %s\n"
+        % (tmp_path / "one_index", tmp_path / "one.db"),
+        encoding="utf-8",
+    )
+    second = tmp_path / "second.ini"
+    second.write_text(
+        "[knowledge]\nindex_dir = %s\n\n[service]\ndb_path = %s\n"
+        % (tmp_path / "two_index", tmp_path / "two.db"),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("KNOWLEDGE_SERVICE_INI", str(first))
+    assert config.get_db_path().endswith("one.db")
+    assert config.get_index_dir().endswith("one_index")
+    assert config.ini_path() == str(first)
+
+    # Same process, no reload() call: the new value must win on the next call.
+    monkeypatch.setenv("KNOWLEDGE_SERVICE_INI", str(second))
+    assert config.get_db_path().endswith("two.db")
+    assert config.get_index_dir().endswith("two_index")
+    assert config.ini_path() == str(second)
+
+
+def test_guard_fixture_detects_a_write_outside_tmp(tmp_path):
+    """The guard fixture notices a write into a copy of the operator layout."""
+    # The autouse fixture is in effect for this test already.
+    assert str(os.environ["KNOWLEDGE_SERVICE_INI"]).startswith(str(tmp_path))
+
+    layout = tmp_path / "operator-layout"
+    (layout / "knowledge_index").mkdir(parents=True)
+    database = layout / "knowledge.db"
+    database.write_text("one\n", encoding="utf-8")
+    store = layout / "knowledge_index" / "flowrunner.jsonl"
+    store.write_text("alpha\n", encoding="utf-8")
+
+    before = snapshot_tree(layout)
+    assert changed_entries(before, snapshot_tree(layout)) == []
+
+    database.write_text("two and longer\n", encoding="utf-8")
+    assert changed_entries(before, snapshot_tree(layout)) == ["knowledge.db"]
+
+    store.unlink()
+    assert changed_entries(before, snapshot_tree(layout)) == [
+        "knowledge.db",
+        "knowledge_index/flowrunner.jsonl",
+    ]
+
+    # A missing directory is not a change: nothing to compare against.
+    assert snapshot_tree(layout / "absent") == {}
+    assert changed_entries({}, snapshot_tree(layout / "absent")) == []
+
+    assert OPERATOR_DIRS == (
+        Path.home() / ".local/share/knowledge-service",
+        Path.home() / ".local/share/dpmtf/knowledge_index",
+    )
