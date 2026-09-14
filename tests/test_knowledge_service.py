@@ -362,6 +362,7 @@ def test_scopes_route_lists_registry_rows(tmp_path, monkeypatch):
         "status": "changed",
         "document_count": 3,
         "indexed_at": payload[0]["indexed_at"],
+        "repository_path": "",
     }
     assert payload[0]["indexed_at"]
     assert payload[1]["scope"] == "beta"

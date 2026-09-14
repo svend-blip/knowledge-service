@@ -373,7 +373,8 @@ def list_scopes() -> list[dict]:
     try:
         conn = db.connect()
         rows = conn.execute(
-            "SELECT scope, provider, status, document_count, updated_at"
+            "SELECT scope, provider, status, document_count, updated_at,"
+            " repository_path"
             " FROM knowledge_indexes ORDER BY scope"
         ).fetchall()
     finally:
@@ -386,6 +387,7 @@ def list_scopes() -> list[dict]:
             "status": row["status"],
             "document_count": row["document_count"],
             "indexed_at": row["updated_at"],
+            "repository_path": row["repository_path"],
         }
         for row in rows
     ]
@@ -494,14 +496,20 @@ def create_app():
     @application.get("/v1/learning")
     async def learning_route(
         history: bool = False,
+        repository: str | None = None,
         _token: None = Depends(require_token),
     ) -> dict:
         """List admitted learning artifacts; ``history=true`` lists old ones.
 
         Read-only, no scope guard: the learning scopes are public, like the
-        CLI listing.
+        CLI listing. Rows carry ``repository``; ``repository=<slug>`` filters
+        them to that repository alone.
         """
-        return {"artifacts": learning.list_artifact_records(history)}
+        records = learning.list_artifact_records(history)
+        if repository:
+            slug = scope_for_path(repository)
+            records = [item for item in records if item.get("repository") == slug]
+        return {"artifacts": records}
 
     @application.get("/v1/learning/drafts")
     async def learning_drafts_route(

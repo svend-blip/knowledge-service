@@ -54,7 +54,11 @@ CREATE TABLE IF NOT EXISTS knowledge_indexes (
     location       TEXT NOT NULL DEFAULT '',
     document_count INTEGER NOT NULL DEFAULT 0 CHECK (document_count >= 0),
     status         TEXT NOT NULL DEFAULT 'unknown',
-    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    -- Added after ``updated_at`` (correction 1). It stays last so an older
+    -- database upgraded with ``ALTER TABLE ... ADD COLUMN`` ends up in the
+    -- same column order as one created here; see ``_upgrade_indexes``.
+    repository_path TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_knowledge_indexes_provider
@@ -161,10 +165,37 @@ def _upgrade_retrieval_log(conn: sqlite3.Connection) -> None:
     return None
 
 
+def _upgrade_indexes(conn: sqlite3.Connection) -> None:
+    """Add ``repository_path`` to an index registry created before it existed.
+
+    Databases before correction 1 carry only ``location``: an imported row
+    holds the manifest path of its source registry there and has nowhere else
+    to keep the repository directory. Same in-place upgrade as ``flow_key``:
+    detection by column name through ``pragma table_info``, then one
+    ``ALTER TABLE ... ADD COLUMN``; existing rows keep their values and read
+    back with an empty ``repository_path`` until a ``refresh`` or
+    ``set-repository`` records the directory.
+    """
+    columns = [row[1] for row in conn.execute(
+        "PRAGMA table_info(knowledge_indexes)"
+    ).fetchall()]
+    if not columns:
+        # No table at all in this database: the statements above created it
+        # with the column already present.
+        return None
+    if "repository_path" not in columns:
+        conn.execute(
+            "ALTER TABLE knowledge_indexes "
+            "ADD COLUMN repository_path TEXT NOT NULL DEFAULT ''"
+        )
+    return None
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create the four knowledge tables and upgrade the retrieval log."""
+    """Create the four knowledge tables and upgrade older ones in place."""
     conn.executescript(SCHEMA_SQL)
     _upgrade_retrieval_log(conn)
+    _upgrade_indexes(conn)
     conn.commit()
     return None
 

@@ -1,7 +1,8 @@
 """Command-line entry point for the standalone knowledge service.
 
 Invoked as ``python -m knowledge_service.cli <command>``. Commands:
-``serve``, ``refresh``, ``refresh-all``, ``scopes``, ``grant``, ``revoke``,
+``serve``, ``refresh``, ``refresh-all``, ``scopes``, ``set-repository``,
+``grant``, ``revoke``,
 ``import-registry``, ``download-model``, ``learning`` (with subcommands
 ``validate``, ``validate-run``, ``admit``, ``admit-run``, ``drafts``,
 ``retract``, ``list``, ``rebuild``). Errors are one
@@ -73,18 +74,21 @@ def _cmd_refresh(args: argparse.Namespace) -> int:
     return 0
 
 
-def _registry_rows() -> list[tuple[str, str]]:
-    """Return ``(scope, repository_path)`` pairs from the index registry."""
+def _registry_rows() -> list[tuple[str, str, str]]:
+    """Return ``(scope, repository_path, location)`` rows of the registry."""
     conn = None
     try:
         conn = db.connect()
         rows = conn.execute(
-            "SELECT scope, location FROM knowledge_indexes ORDER BY scope"
+            "SELECT scope, repository_path, location FROM knowledge_indexes"
+            " ORDER BY scope"
         ).fetchall()
     finally:
         if conn is not None:
             conn.close()
-    return [(row["scope"], row["location"]) for row in rows]
+    return [
+        (row["scope"], row["repository_path"], row["location"]) for row in rows
+    ]
 
 
 def _cmd_refresh_all(args: argparse.Namespace) -> int:
@@ -92,7 +96,7 @@ def _cmd_refresh_all(args: argparse.Namespace) -> int:
     pairs = _registry_rows()
     failures = 0
     considered = 0
-    for scope, location in pairs:
+    for scope, repository_path, location in pairs:
         if knowledge_maintenance.is_learning_location(location):
             print(
                 f"knowledge-service: skip {scope}: learning-managed scope "
@@ -100,11 +104,15 @@ def _cmd_refresh_all(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             continue
-        repo_path = Path(location).expanduser() if location else None
+        # ``repository_path`` is the fact; a row this service wrote before
+        # the column existed keeps working through its directory ``location``,
+        # and an imported manifest path matches neither.
+        candidate = repository_path or location
+        repo_path = Path(candidate).expanduser() if candidate else None
         if repo_path is None or not repo_path.is_dir():
             print(
-                f"knowledge-service: skip {scope}: recorded repository path "
-                f"'{location}' does not exist",
+                f"knowledge-service: skip {scope}: repository_path missing;"
+                f" record it with 'set-repository {scope} <path>'",
                 file=sys.stderr,
             )
             continue
@@ -162,6 +170,38 @@ def _cmd_scopes(_args: argparse.Namespace) -> int:
             f"{row['scope']}\t{row['provider']}\t{row['status']}\t"
             f"{row['document_count']}\t{row['updated_at']}"
         )
+    return 0
+
+
+def _cmd_set_repository(args: argparse.Namespace) -> int:
+    """Record the repository directory on an existing registry row."""
+    scope = args.scope.strip()
+    if not scope:
+        return _fail("scope must not be empty")
+    repo_path = Path(args.path).expanduser()
+    if not repo_path.is_dir():
+        return _fail(f"path is not an existing directory: {repo_path}")
+
+    conn = None
+    try:
+        conn = db.connect()
+        cur = conn.execute(
+            "UPDATE knowledge_indexes SET repository_path = ?,"
+            " updated_at = datetime('now') WHERE scope = ?",
+            (str(repo_path), scope),
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        return _fail(f"cannot record repository path: {exc}")
+    finally:
+        if conn is not None:
+            conn.close()
+    if cur.rowcount == 0:
+        return _fail(
+            f"no registry row for scope {scope};"
+            " refresh it once before setting its repository path"
+        )
+    print(f"repository_path set for {scope}: {repo_path}")
     return 0
 
 
@@ -453,6 +493,15 @@ def build_parser() -> argparse.ArgumentParser:
     scopes = subparsers.add_parser("scopes", help="list the index registry")
     scopes.set_defaults(handler=_cmd_scopes)
 
+    set_repository = subparsers.add_parser(
+        "set-repository", help="record a scope's repository directory"
+    )
+    set_repository.add_argument("scope", help="scope slug, e.g. flowrunner")
+    set_repository.add_argument(
+        "path", help="repository directory holding the .flowrunner runs root"
+    )
+    set_repository.set_defaults(handler=_cmd_set_repository)
+
     learning_parser = subparsers.add_parser(
         "learning", help="manage validated learning artifacts"
     )
@@ -472,7 +521,10 @@ def build_parser() -> argparse.ArgumentParser:
     learning_admit_run = learning_sub.add_parser(
         "admit-run", help="admit one closed run's LEARNING-DRAFT in place"
     )
-    learning_admit_run.add_argument("ref", help="family/run, e.g. 2000/041")
+    learning_admit_run.add_argument(
+        "ref", help="repository/family/run, e.g. dpmtf-webui/2000/041; "
+        "family/run means the father repository"
+    )
     learning_admit_run.add_argument(
         "--admitted-by", default="", help="name of the admitting supervisor"
     )
@@ -480,7 +532,10 @@ def build_parser() -> argparse.ArgumentParser:
     learning_validate_run = learning_sub.add_parser(
         "validate-run", help="list one run draft's violations and its run status"
     )
-    learning_validate_run.add_argument("ref", help="family/run, e.g. 2000/041")
+    learning_validate_run.add_argument(
+        "ref", help="repository/family/run, e.g. dpmtf-webui/2000/041; "
+        "family/run means the father repository"
+    )
     learning_validate_run.set_defaults(handler=_cmd_learning)
     learning_drafts = learning_sub.add_parser(
         "drafts", help="list the run-directory drafts awaiting admission"
@@ -489,7 +544,10 @@ def build_parser() -> argparse.ArgumentParser:
     learning_retract = learning_sub.add_parser(
         "retract", help="move one admitted artifact to history"
     )
-    learning_retract.add_argument("ref", help="family/run, e.g. 2000/029")
+    learning_retract.add_argument(
+        "ref", help="repository/family/run, e.g. dpmtf-webui/2000/029; "
+        "family/run means the father repository"
+    )
     learning_retract.set_defaults(handler=_cmd_learning)
     learning_list = learning_sub.add_parser(
         "list", help="list admitted artifacts with topic, level and confidence"

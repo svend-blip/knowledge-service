@@ -142,7 +142,8 @@ def setup_service(tmp_path, monkeypatch, enabled: str = "true") -> None:
 def seed_repository_scope(tmp_path) -> None:
     """Give the ``flowrunner`` scope a registry row and a stub store marker."""
     maintenance.record_index(
-        "flowrunner", "stub", str(tmp_path / "repo"), 1, "changed"
+        "flowrunner", "stub", str(tmp_path / "repo"), 1, "changed",
+        repository_path=str(tmp_path / "repo"),
     )
     index_dir = Path(config.get_index_dir())
     index_dir.mkdir(parents=True, exist_ok=True)
@@ -154,7 +155,7 @@ def make_doc(**overrides) -> dict:
     doc = {
         "topic": "Share one index directory across scopes",
         "scope": "experience",
-        "repository": "flowrunner",
+        "repository": "dpmtf-webui",
         "family": "2000",
         "run": "029",
         "problem": "Each scope rebuilt its own tree scan.",
@@ -274,19 +275,19 @@ def test_admit_refuses_a_run_without_success_end_report(tmp_path, monkeypatch):
 
     close_run(tmp_path, "2000", "029", status="BLOCKED")
     assert learning.admit(str(draft)) == 1
-    assert not learning.learning_dir().joinpath("2000", "029.yaml").is_file()
+    assert not learning.learning_dir().joinpath("dpmtf-webui", "2000", "029.yaml").is_file()
     assert not (learning.learning_dir() / "LEDGER.md").is_file()
 
     close_run(tmp_path, "2000", "029", status="SUCCESS")
     assert learning.admit(str(draft)) == 0
-    assert learning.learning_dir().joinpath("2000", "029.yaml").is_file()
+    assert learning.learning_dir().joinpath("dpmtf-webui", "2000", "029.yaml").is_file()
 
     # A missing runs directory skips the closure check with a warning: run
     # 030 has no directory under runs_root but is admitted anyway.
     doc_030 = make_doc(run="030")
     draft_030 = write_draft(tmp_path, doc_030, "draft030.yaml")
     assert learning.admit(str(draft_030)) == 0
-    assert learning.learning_dir().joinpath("2000", "030.yaml").is_file()
+    assert learning.learning_dir().joinpath("dpmtf-webui", "2000", "030.yaml").is_file()
 
 
 # ── admission ───────────────────────────────────────────────────────────
@@ -304,12 +305,12 @@ def test_admit_writes_manifests_and_rebuilds_both_scopes(tmp_path, monkeypatch):
     assert len(experience) == 1
     record = experience[0]
     assert record["scope"] == "experience"
-    assert record["path"] == "2000/029.yaml"
+    assert record["path"] == "dpmtf-webui/2000/029.yaml"
     metadata = record["metadata"]
     assert metadata["scope"] == "experience"
-    assert metadata["path"] == "2000/029.yaml"
+    assert metadata["path"] == "dpmtf-webui/2000/029.yaml"
     assert metadata["evidence_level"] == "tests"
-    assert metadata["repository"] == "flowrunner"
+    assert metadata["repository"] == "dpmtf-webui"
     assert metadata["family"] == "2000"
     assert metadata["run"] == "029"
     assert metadata["confidence"] == "high"
@@ -322,7 +323,7 @@ def test_admit_writes_manifests_and_rebuilds_both_scopes(tmp_path, monkeypatch):
     assert len(ecosystem) == 1
     assert "One LEANN store per scope" in ecosystem[0]["content"]
     assert ecosystem[0]["metadata"]["origin"] == (
-        "2000/029/Share one index directory across scopes"
+        "dpmtf-webui/2000/029/Share one index directory across scopes"
     )
 
     sources = RecordingProvider.index_calls
@@ -346,7 +347,7 @@ def test_admit_first_artifact_exits_zero_with_empty_history(tmp_path, monkeypatc
     assert learning.admit(str(draft)) == 0
 
     directory = learning.learning_dir()
-    assert directory.joinpath("2000", "029.yaml").is_file()
+    assert directory.joinpath("dpmtf-webui", "2000", "029.yaml").is_file()
     ledger_lines = [
         line
         for line in (directory / "LEDGER.md").read_text(encoding="utf-8").splitlines()
@@ -374,25 +375,25 @@ def test_supersede_moves_the_older_artifact_to_history(tmp_path, monkeypatch):
 
     assert learning.admit(str(write_draft(tmp_path, old, "old.yaml"))) == 0
     directory = learning.learning_dir()
-    assert directory.joinpath("2000", "021.yaml").is_file()
+    assert directory.joinpath("dpmtf-webui", "2000", "021.yaml").is_file()
 
     assert learning.admit(str(write_draft(tmp_path, newer, "new.yaml"))) == 0
 
-    assert not directory.joinpath("2000", "021.yaml").is_file()
-    history_file = directory / "history" / "2000" / "021.yaml"
+    assert not directory.joinpath("dpmtf-webui", "2000", "021.yaml").is_file()
+    history_file = directory / "history" / "dpmtf-webui" / "2000" / "021.yaml"
     assert history_file.is_file()
 
     moved = yaml.safe_load(history_file.read_text(encoding="utf-8"))
-    assert moved["superseded_by"] == "2000/029"
+    assert moved["superseded_by"] == "dpmtf-webui/2000/029"
 
     live_paths = [
         record["path"] for record in read_jsonl(directory / "experience.jsonl")
     ]
-    assert live_paths == ["2000/029.yaml"]
+    assert live_paths == ["dpmtf-webui/2000/029.yaml"]
     history_records = read_jsonl(directory / "experience-history.jsonl")
     assert len(history_records) == 1
-    assert history_records[0]["path"] == "2000/021.yaml"
-    assert history_records[0]["metadata"]["superseded_by"] == "2000/029"
+    assert history_records[0]["path"] == "dpmtf-webui/2000/021.yaml"
+    assert history_records[0]["metadata"]["superseded_by"] == "dpmtf-webui/2000/029"
 
 
 def test_retract_moves_to_history_and_rebuilds(tmp_path, monkeypatch):
@@ -404,8 +405,8 @@ def test_retract_moves_to_history_and_rebuilds(tmp_path, monkeypatch):
     assert learning.retract("2000/029") == 0
 
     directory = learning.learning_dir()
-    assert not directory.joinpath("2000", "029.yaml").is_file()
-    history_file = directory / "history" / "2000" / "029.yaml"
+    assert not directory.joinpath("dpmtf-webui", "2000", "029.yaml").is_file()
+    history_file = directory / "history" / "dpmtf-webui" / "2000" / "029.yaml"
     assert history_file.is_file()
 
     moved = yaml.safe_load(history_file.read_text(encoding="utf-8"))
@@ -740,12 +741,12 @@ def test_search_results_carry_passage_metadata(tmp_path, monkeypatch):
     response = client.get("/v1/search", params={"q": "index", "scope": "experience"})
     assert response.status_code == 200
     hit = response.json()["results"][0]
-    assert hit["path"] == "2000/029.yaml"
+    assert hit["path"] == "dpmtf-webui/2000/029.yaml"
     metadata = hit["metadata"]
     assert metadata["evidence_level"] == "tests"
     assert metadata["family"] == "2000"
     assert metadata["run"] == "029"
-    assert metadata["repository"] == "flowrunner"
+    assert metadata["repository"] == "dpmtf-webui"
     assert metadata["confidence"] == "high"
     # Identity keys sit on the result itself, not twice inside metadata.
     assert "path" not in metadata
@@ -810,7 +811,7 @@ def test_learning_route_lists_admitted_and_history(tmp_path, monkeypatch, capsys
     assert history.status_code == 200
     old = history.json()["artifacts"]
     assert [(item["family"], item["run"]) for item in old] == [("1000", "007")]
-    assert old[0]["superseded_by"] == "1000/012"
+    assert old[0]["superseded_by"] == "dpmtf-webui/1000/012"
     assert old[0]["retracted_at"] is None
 
     assert RecordingProvider.search_calls == []
@@ -818,9 +819,9 @@ def test_learning_route_lists_admitted_and_history(tmp_path, monkeypatch, capsys
     # The CLI listing shares the records, printing byte-identical lines.
     assert cli.main(["learning", "list"]) == 0
     printed = capsys.readouterr().out.splitlines()
-    assert printed[0] == "1000/012\tNewest one\ttests\thigh\tsupervisor"
+    assert printed[0] == "dpmtf-webui/1000/012\tNewest one\ttests\thigh\tsupervisor"
     assert printed[1] == (
-        "2000/029\tShare one index directory across scopes\ttests\thigh\tsupervisor"
+        "dpmtf-webui/2000/029\tShare one index directory across scopes\ttests\thigh\tsupervisor"
     )
 
 
@@ -829,7 +830,7 @@ def test_learning_route_lists_admitted_and_history(tmp_path, monkeypatch, capsys
 
 def write_run_draft(tmp_path: Path, family: str, run: str, doc: dict) -> Path:
     """Write ``doc`` to ``<runs_root>/<family>/runs/<run>/LEARNING-DRAFT.yaml``."""
-    path = learning.draft_path(family, run)
+    path = learning.draft_path(None, family, run)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8"
@@ -858,11 +859,11 @@ def test_admit_run_reads_the_draft_from_the_runs_root_and_sets_admitted_by(
     )
     before = draft.read_bytes()
 
-    assert learning.draft_path("2000", "041") == draft
+    assert learning.draft_path(None, "2000", "041") == draft
     assert learning.admit_run("2000/041", "svend") == 0
 
     artifact = yaml.safe_load(
-        (learning.learning_dir() / "2000" / "041.yaml").read_text(encoding="utf-8")
+        (learning.learning_dir() / "dpmtf-webui" / "2000" / "041.yaml").read_text(encoding="utf-8")
     )
     assert artifact["admitted_by"] == "svend"
     assert artifact["topic"] == "Share one index directory across scopes"
@@ -873,7 +874,7 @@ def test_admit_run_reads_the_draft_from_the_runs_root_and_sets_admitted_by(
 
     lines = ledger_lines()
     assert len(lines) == 1
-    assert "| admitted | 2000/041 | tests | svend |" in lines[0]
+    assert "| admitted | dpmtf-webui/2000/041 | tests | svend |" in lines[0]
     assert lines[0].endswith(f"| source={draft}")
 
 
@@ -890,12 +891,12 @@ def test_admit_run_refuses_pending_missing_and_unclosed(tmp_path, monkeypatch):
     assert learning.admit_run("2000/041", "   ") == 1
     assert learning.admit_run("no-slash", "svend") == 1
     assert learning.admit_run("1000/007", "svend") == 1  # no draft there
-    assert not directory.joinpath("2000", "041.yaml").is_file()
+    assert not directory.joinpath("dpmtf-webui", "2000", "041.yaml").is_file()
     assert ledger_lines() == []
 
     close_run(tmp_path, "2000", "041", status="BLOCKED")
     assert learning.admit_run("2000/041", "svend") == 1
-    assert not directory.joinpath("2000", "041.yaml").is_file()
+    assert not directory.joinpath("dpmtf-webui", "2000", "041.yaml").is_file()
     assert ledger_lines() == []
 
 
@@ -917,7 +918,7 @@ def test_validate_run_reports_violations_and_run_status_without_admitting(
     assert "run status: SUCCESS" in printed
 
     directory = learning.learning_dir()
-    assert not directory.joinpath("2000", "041.yaml").is_file()
+    assert not directory.joinpath("dpmtf-webui", "2000", "041.yaml").is_file()
     assert ledger_lines() == []
 
     write_run_draft(tmp_path, "2000", "041", make_doc(run="041"))
@@ -963,7 +964,7 @@ def test_drafts_route_lists_pending_drafts_with_run_status(tmp_path, monkeypatch
         "012",
         make_doc(family="1000", run="012", topic="Newest one", admitted_by="pending"),
     )
-    broken = learning.draft_path("2000", "041")
+    broken = learning.draft_path(None, "2000", "041")
     broken.parent.mkdir(parents=True, exist_ok=True)
     broken.write_text("topic: [unclosed\n", encoding="utf-8")
 
@@ -1022,8 +1023,8 @@ def test_cli_learning_admit_run_and_drafts(tmp_path, monkeypatch, capsys):
     assert cli.main(["learning", "drafts"]) == 0
     printed = capsys.readouterr().out.splitlines()
     assert len(printed) == 2
-    assert printed[0] == "1000/007\tOlder one\ttests\tSUCCESS\tpending\tvalid\t0"
-    assert printed[1].startswith("2000/041\tShare one index directory")
+    assert printed[0] == "dpmtf-webui/1000/007\tOlder one\ttests\tSUCCESS\tpending\tvalid\t0"
+    assert printed[1].startswith("dpmtf-webui/2000/041\tShare one index directory")
     assert printed[1].endswith("\tSUCCESS\tpending\tvalid\t0")
 
     assert cli.main(["learning", "validate-run", "2000/041"]) == 0
@@ -1035,24 +1036,375 @@ def test_cli_learning_admit_run_and_drafts(tmp_path, monkeypatch, capsys):
         )
         == 0
     )
-    artifact = learning.learning_dir() / "2000" / "041.yaml"
+    artifact = learning.learning_dir() / "dpmtf-webui" / "2000" / "041.yaml"
     assert artifact.is_file()
     doc = yaml.safe_load(artifact.read_text(encoding="utf-8"))
     assert doc["admitted_by"] == "svend"
     assert ledger_lines()[-1].endswith(
-        f"| source={learning.draft_path('2000', '041')}"
+        f"| source={learning.draft_path(None, '2000', '041')}"
     )
 
     # The CLI writes exactly where the function writes, through the same path.
-    assert learning.learning_dir().joinpath("1000", "007.yaml") == learning._artifact_path(
-        "1000", "007"
-    )
+    assert learning.learning_dir().joinpath(
+        "dpmtf-webui", "1000", "007.yaml"
+    ) == learning._artifact_path(None, "1000", "007")
     assert learning.admit_run("1000/007", "reviewer") == 0
-    assert learning.learning_dir().joinpath("1000", "007.yaml").is_file()
+    assert learning.learning_dir().joinpath("dpmtf-webui", "1000", "007.yaml").is_file()
 
     assert cli.main(["learning", "drafts"]) == 0
     printed = capsys.readouterr().out.splitlines()
-    assert [line.split("\t")[0] for line in printed] == ["1000/007", "2000/041"]
+    assert [line.split("\t")[0] for line in printed] == ["dpmtf-webui/1000/007", "dpmtf-webui/2000/041"]
     assert all("\tadmitted\tvalid\t0" in line for line in printed)
 
     assert cli.main(["learning", "admit-run", "no-slash", "--admitted-by", "x"]) == 1
+
+
+# ── A2-4: repository-scoped artifacts ───────────────────────────────────
+
+
+def test_artifact_key_carries_the_repository_slug(tmp_path, monkeypatch):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "2000", "029")
+    assert learning.admit(str(write_draft(tmp_path, make_doc(), "father.yaml"))) == 0
+    assert learning.admit(
+        str(write_draft(tmp_path, make_doc(repository="FlowRunner"), "child.yaml"))
+    ) == 0
+
+    directory = learning.learning_dir()
+    assert directory.joinpath("dpmtf-webui", "2000", "029.yaml").is_file()
+    assert directory.joinpath("flowrunner", "2000", "029.yaml").is_file()
+    assert not directory.joinpath("2000", "029.yaml").exists()
+
+    records = learning.list_artifact_records()
+    assert [
+        (item["repository"], item["family"], item["run"]) for item in records
+    ] == [
+        ("dpmtf-webui", "2000", "029"),
+        ("flowrunner", "2000", "029"),
+    ]
+
+    lines = ledger_lines()
+    assert len(lines) == 2
+    assert any("dpmtf-webui/2000/029" in line for line in lines)
+    assert any("flowrunner/2000/029" in line for line in lines)
+
+
+def test_legacy_layout_is_migrated_once_with_a_ledger_line(tmp_path, monkeypatch):
+    setup_service(tmp_path, monkeypatch)
+    directory = learning.learning_dir()
+    legacy = directory / "2000" / "029.yaml"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        yaml.safe_dump(make_doc(), sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+    legacy_history = directory / "history" / "1000" / "007.yaml"
+    legacy_history.parent.mkdir(parents=True)
+    legacy_history.write_text(
+        yaml.safe_dump(make_doc(family="1000", run="007"), sort_keys=False), encoding="utf-8"
+    )
+
+    assert learning.migrate_legacy_layout() == 2
+
+    assert directory.joinpath("dpmtf-webui", "2000", "029.yaml").is_file()
+    assert directory.joinpath("history", "dpmtf-webui", "1000", "007.yaml").is_file()
+    assert not legacy.exists()
+    assert not legacy_history.exists()
+
+    lines = ledger_lines()
+    assert len(lines) == 2
+    assert all("migrated" in line for line in lines)
+    assert any("dpmtf-webui/2000/029" in line for line in lines)
+    assert any("dpmtf-webui/1000/007" in line for line in lines)
+
+    # Idempotent: a second call moves nothing and writes no new lines.
+    assert learning.migrate_legacy_layout() == 0
+    assert len(ledger_lines()) == 2
+
+    # rebuild keeps the migrated tree; manifests carry the new layout paths.
+    assert learning.rebuild() == 0
+    paths = [record["path"] for record in read_jsonl(directory / "experience.jsonl")]
+    assert paths == ["dpmtf-webui/2000/029.yaml"]
+
+
+def test_supersedes_accepts_two_and_three_part_references(tmp_path, monkeypatch):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "2000", "021")
+    close_run(tmp_path, "2000", "029")
+    assert learning.admit(
+        str(write_draft(tmp_path, make_doc(run="021"), "old.yaml"))
+    ) == 0
+    assert learning.admit(
+        str(
+            write_draft(
+                tmp_path,
+                make_doc(supersedes=["dpmtf-webui/2000/021"]),
+                "new.yaml",
+            )
+        )
+    ) == 0
+    directory = learning.learning_dir()
+    moved = yaml.safe_load(
+        directory.joinpath(
+            "history", "dpmtf-webui", "2000", "021.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    assert moved["superseded_by"] == "dpmtf-webui/2000/029"
+
+    close_run(tmp_path, "1000", "007")
+    close_run(tmp_path, "1000", "012")
+    assert learning.admit(
+        str(write_draft(tmp_path, make_doc(family="1000", run="007"), "seven.yaml"))
+    ) == 0
+    assert learning.admit(
+        str(
+            write_draft(
+                tmp_path,
+                make_doc(family="1000", run="012", supersedes=["1000/007"]),
+                "twelve.yaml",
+            )
+        )
+    ) == 0
+    moved = yaml.safe_load(
+        directory.joinpath(
+            "history", "dpmtf-webui", "1000", "007.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    assert moved["superseded_by"] == "dpmtf-webui/1000/012"
+
+    doc = make_doc()
+    assert learning.validate(dict(doc, supersedes=["dpmtf-webui/2000/021"])) == []
+    assert learning.validate(dict(doc, supersedes=["2000/021"])) == []
+    assert learning.validate(dict(doc, supersedes=["one-part"]))
+    assert learning.validate(dict(doc, supersedes=["a/b/c/d"]))
+
+
+def test_drafts_are_found_under_every_registered_repository(tmp_path, monkeypatch):
+    setup_service(tmp_path, monkeypatch)
+    seed_repository_scope(tmp_path)
+    maintenance.record_index(
+        "alpha", "stub", str(tmp_path / "repo-alpha"), 1, "changed",
+        repository_path=str(tmp_path / "repo-alpha"),
+    )
+
+    flow_run = tmp_path / "repo" / ".flowrunner" / "1000" / "runs" / "007"
+    flow_run.mkdir(parents=True)
+    flow_run.joinpath("LEARNING-DRAFT.yaml").write_text(
+        yaml.safe_dump(
+            make_doc(family="1000", run="007", repository="flowrunner"),
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    flow_run.joinpath("END-REPORT.md").write_text(
+        "# END-REPORT\n**Status:** SUCCESS\n", encoding="utf-8"
+    )
+
+    alpha_run = tmp_path / "repo-alpha" / ".flowrunner" / "3000" / "runs" / "001"
+    alpha_run.mkdir(parents=True)
+    alpha_run.joinpath("LEARNING-DRAFT.yaml").write_text(
+        yaml.safe_dump(
+            make_doc(family="3000", run="001", repository="alpha"), sort_keys=False
+        ),
+        encoding="utf-8",
+    )
+
+    close_run(tmp_path, "2000", "041")
+    write_run_draft(tmp_path, "2000", "041", make_doc(run="041"))
+
+    rows = learning.list_pending_drafts()
+    assert [
+        (item["repository"], item["family"], item["run"]) for item in rows
+    ] == [
+        ("flowrunner", "1000", "007"),
+        ("dpmtf-webui", "2000", "041"),
+        ("alpha", "3000", "001"),
+    ]
+    assert rows[0]["run_status"] == "SUCCESS"
+    assert rows[2]["run_status"] == "missing"
+    assert all(item["admitted"] is False for item in rows)
+
+    client = TestClient(create_app())
+    response = client.get("/v1/learning/drafts")
+    assert response.status_code == 200
+    assert response.json()["drafts"] == rows
+
+    assert learning.admit_run("flowrunner/1000/007", "svend") == 0
+    assert learning.learning_dir().joinpath(
+        "flowrunner", "1000", "007.yaml"
+    ).is_file()
+
+    artifacts = client.get("/v1/learning").json()["artifacts"]
+    assert [
+        (item["repository"], item["family"], item["run"]) for item in artifacts
+    ] == [("flowrunner", "1000", "007")]
+    kept = client.get(
+        "/v1/learning", params={"repository": "FlowRunner"}
+    ).json()["artifacts"]
+    assert [(item["repository"], item["family"]) for item in kept] == [
+        ("flowrunner", "1000")
+    ]
+    assert client.get(
+        "/v1/learning", params={"repository": "alpha"}
+    ).json()["artifacts"] == []
+
+
+def test_admit_run_refuses_a_draft_whose_repository_does_not_match(
+    tmp_path, monkeypatch
+):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "2000", "041")
+    write_run_draft(
+        tmp_path, "2000", "041", make_doc(run="041", repository="flowrunner")
+    )
+    directory = learning.learning_dir()
+
+    assert learning.admit_run("dpmtf-webui/2000/041", "svend") == 1
+    assert learning.admit_run("2000/041", "svend") == 1
+    assert not directory.joinpath("dpmtf-webui", "2000", "041.yaml").is_file()
+    assert ledger_lines() == []
+
+    write_run_draft(tmp_path, "2000", "041", make_doc(run="041"))
+    assert learning.admit_run("dpmtf-webui/2000/041", "svend") == 0
+    assert directory.joinpath("dpmtf-webui", "2000", "041.yaml").is_file()
+    lines = ledger_lines()
+    assert len(lines) == 1
+    assert "dpmtf-webui/2000/041" in lines[0]
+
+
+def test_learning_routes_and_cli_take_three_part_refs(tmp_path, monkeypatch, capsys):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "1000", "007")
+    close_run(tmp_path, "2000", "041")
+    write_run_draft(
+        tmp_path,
+        "1000",
+        "007",
+        make_doc(
+            family="1000", run="007", topic="Older one", admitted_by="pending"
+        ),
+    )
+    write_run_draft(
+        tmp_path, "2000", "041", make_doc(run="041", admitted_by="pending")
+    )
+
+    client = TestClient(create_app())
+    items = client.get(
+        "/v1/learning/drafts", params={"pending": "true"}
+    ).json()["drafts"]
+    assert [
+        (item["repository"], item["family"], item["run"]) for item in items
+    ] == [
+        ("dpmtf-webui", "1000", "007"),
+        ("dpmtf-webui", "2000", "041"),
+    ]
+
+    assert (
+        cli.main(
+            ["learning", "admit-run", "dpmtf-webui/2000/041", "--admitted-by", "svend"]
+        )
+        == 0
+    )
+    assert learning.learning_dir().joinpath(
+        "dpmtf-webui", "2000", "041.yaml"
+    ).is_file()
+    capsys.readouterr()
+
+    artifacts = client.get("/v1/learning").json()["artifacts"]
+    assert [
+        (item["repository"], item["family"], item["run"]) for item in artifacts
+    ] == [("dpmtf-webui", "2000", "041")]
+    kept = client.get(
+        "/v1/learning", params={"repository": "DPMtF-WebUI"}
+    ).json()["artifacts"]
+    assert kept == artifacts
+    assert client.get(
+        "/v1/learning", params={"repository": "flowrunner"}
+    ).json()["artifacts"] == []
+
+    assert cli.main(["learning", "list"]) == 0
+    printed = capsys.readouterr().out.splitlines()
+    assert printed[0].startswith("dpmtf-webui/2000/041\t")
+
+    assert cli.main(["learning", "validate-run", "dpmtf-webui/9999/001"]) == 1
+    assert "does not exist" in capsys.readouterr().err
+
+    assert cli.main(["learning", "validate-run", "one"]) == 1
+    assert "reference must be" in capsys.readouterr().err
+
+    assert cli.main(["learning", "validate-run", "nosuchrepo/2000/041"]) == 1
+    assert "unknown repository: nosuchrepo" in capsys.readouterr().err
+
+    assert learning.retract("dpmtf-webui/2000/041") == 0
+    assert learning.learning_dir().joinpath(
+        "history", "dpmtf-webui", "2000", "041.yaml"
+    ).is_file()
+    history = client.get("/v1/learning", params={"history": "true"}).json()["artifacts"]
+    assert history[0]["repository"] == "dpmtf-webui"
+    assert history[0]["retracted_at"]
+
+
+def test_refresh_records_the_repository_path_and_refresh_all_uses_it(
+    tmp_path, monkeypatch, capsys
+):
+    setup_service(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    repo.joinpath("notes.md").write_text("# notes\n", encoding="utf-8")
+
+    result = maintenance.refresh_scope("beta", str(repo))
+    assert result["status"] in {"changed", "noop", "reindexed"}
+
+    conn = db.connect()
+    try:
+        row = conn.execute(
+            "SELECT repository_path FROM knowledge_indexes WHERE scope = ?",
+            ("beta",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert Path(row["repository_path"]).resolve() == repo.resolve()
+
+    # An imported-style row: manifest location, empty repository_path.
+    maintenance.record_index(
+        "gamma",
+        "stub",
+        str(Path(config.get_index_dir()) / "gamma.jsonl"),
+        1,
+        "changed",
+    )
+
+    assert cli.main(["refresh-all", "--from-registry", "--dry-run"]) == 0
+    printed = capsys.readouterr()
+    assert any(line.startswith("beta\t") for line in printed.out.splitlines())
+    assert "gamma" not in printed.out
+    assert "repository_path" in printed.err
+    assert "set-repository gamma" in printed.err
+
+    assert cli.main(["set-repository", "gamma", str(repo)]) == 0
+    capsys.readouterr()
+    assert cli.main(["refresh-all", "--from-registry", "--dry-run"]) == 0
+    printed = capsys.readouterr()
+    assert any(line.startswith("gamma\t") for line in printed.out.splitlines())
+
+
+def test_set_repository_cli_and_scopes_route_show_the_path(
+    tmp_path, monkeypatch, capsys
+):
+    setup_service(tmp_path, monkeypatch)
+    maintenance.record_index(
+        "delta", "stub", str(tmp_path / "delta.jsonl"), 1, "changed"
+    )
+
+    assert cli.main(["set-repository", "delta", str(tmp_path / "gone")]) == 1
+    assert "existing directory" in capsys.readouterr().err
+
+    repo = tmp_path / "repo-delta"
+    repo.mkdir()
+    assert cli.main(["set-repository", "delta", str(repo)]) == 0
+    capsys.readouterr()
+
+    client = TestClient(create_app())
+    response = client.get("/v1/scopes")
+    assert response.status_code == 200
+    rows = {row["scope"]: row for row in response.json()}
+    assert Path(rows["delta"]["repository_path"]).resolve() == repo.resolve()

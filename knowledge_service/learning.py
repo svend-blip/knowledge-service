@@ -1,8 +1,10 @@
 """Validated learning artifacts: the experience and ecosystem stores.
 
 One YAML document per closed run lives under
-``<learning_dir>/<family>/<run>.yaml``; superseded or retracted artifacts
-move to ``<learning_dir>/history/<family>/<run>.yaml`` with a
+``<learning_dir>/<repository>/<family>/<run>.yaml``, where ``<repository>``
+is the repository slug of the artifact's ``repository`` field (the same
+rule ``GET /v1/scope-for-path`` applies to paths); superseded or retracted
+artifacts move to ``<learning_dir>/history/<repository>/<family>/<run>.yaml`` with a
 ``superseded_by`` or ``retracted_at`` field written into them. Three JSONL
 manifests are rebuilt from those directories — ``experience`` (one rendered
 passage per artifact), ``ecosystem`` (one passage per non-empty
@@ -31,7 +33,9 @@ from pathlib import Path
 import yaml
 
 from knowledge_service import config
+from knowledge_service import db
 from knowledge_service import maintenance as knowledge_maintenance
+from knowledge_service.scopes import scope_for_path
 
 __all__ = [
     "EVIDENCE_LEVELS",
@@ -51,6 +55,7 @@ __all__ = [
     "list_artifacts",
     "list_pending_drafts",
     "print_drafts",
+    "migrate_legacy_layout",
     "rebuild",
     "build_manifests",
 ]
@@ -108,7 +113,9 @@ def validate(doc) -> list[str]:
     Every key in ``_REQUIRED_KEYS`` is required (empty lists are allowed);
     ``scope`` must be ``experience``, confidence and evidence level come from
     the fixed vocabularies, ``validation`` carries exactly its three keys,
-    and ``supersedes`` entries are ``"<family>/<run>"`` references. An empty
+    and ``supersedes`` entries are ``"<repository>/<family>/<run>"`` or the
+    legacy ``"<family>/<run>"`` (meaning the same repository as the artifact)
+    references; anything else is reported malformed either way. An empty
     list means the document is valid. Never raises.
     """
     violations: list[str] = []
@@ -142,7 +149,9 @@ def validate(doc) -> list[str]:
             for entry in value:
                 if _split_ref(entry) is None:
                     violations.append(
-                        f"supersedes entry must be \"family/run\", got {entry!r}"
+                        f"supersedes entry must be "
+                        f"\"repository/family/run\" or \"family/run\", "
+                        f"got {entry!r}"
                     )
 
     validation = doc.get("validation")
@@ -181,15 +190,24 @@ def levels_at_least(level: str | None) -> list[str]:
     return list(EVIDENCE_LEVELS[: rank + 1])
 
 
-def _split_ref(ref) -> tuple[str, str] | None:
-    """Split a ``"<family>/<run>"`` reference; ``None`` when malformed."""
-    if not isinstance(ref, str) or "/" not in ref:
+def _split_ref(ref) -> tuple[str | None, str, str] | None:
+    """Split a reference into ``(repository, family, run)``; ``None`` malformed.
+
+    A three-part ``"<repository>/<family>/<run>"`` reference carries its own
+    repository slug; the legacy two-part ``"<family>/<run>"`` means the father
+    repository and returns ``None`` for it. Anything else (one part, four or
+    more, an empty segment) is malformed.
+    """
+    if not isinstance(ref, str):
         return None
-    family, _, run = ref.partition("/")
-    family, run = family.strip(), run.strip()
-    if not family or not run or "/" in run:
+    parts = [part.strip() for part in ref.split("/")]
+    if len(parts) not in (2, 3) or not all(parts):
         return None
-    return family, run
+    if len(parts) == 3:
+        repository, family, run = parts
+        return repository, family, run
+    family, run = parts
+    return None, family, run
 
 
 # ── paths ───────────────────────────────────────────────────────────────
@@ -200,23 +218,83 @@ def learning_dir() -> Path:
     return Path(config.get_learning_dir()).expanduser()
 
 
-def draft_path(family: str, run: str) -> Path:
+def _repository_slug(value: str | None) -> str:
+    """The scope slug of a repository name (the ``scope-for-path`` rule)."""
+    return scope_for_path(value or "")
+
+
+def _registry_rows() -> list[tuple[str, str]]:
+    """``(scope, repository_path)`` rows of registered repository scopes."""
+    conn = db.connect()
+    try:
+        rows = conn.execute(
+            "SELECT scope, repository_path FROM knowledge_indexes "
+            "WHERE repository_path <> '' ORDER BY scope"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        (str(row["scope"]), str(row["repository_path"]))
+        for row in rows
+        if str(row["scope"]) not in LEARNING_SCOPES
+    ]
+
+
+def _repository_runs_root(repository: str | None) -> Path:
+    """The runs root of one repository: ``<repository_path>/.flowrunner``.
+
+    ``[learning] runs_root`` stays the father repository's default only; a
+    registered repository lives beside the directory its registry row
+    records as ``repository_path``.
+    """
+    slug = _repository_slug(repository)
+    location = ""
+    for scope, row_location in _registry_rows():
+        if scope == slug:
+            location = row_location
+            break
+    if location:
+        return Path(location).expanduser() / ".flowrunner"
+    return Path(config.get_learning_runs_root()).expanduser()
+
+
+def _repository_is_known(repository: str) -> bool:
+    """Whether a repository has a registry row or is the father repository."""
+    if repository == config.get_scope():
+        return True
+    return any(scope == repository for scope, _ in _registry_rows())
+
+
+def draft_path(repository: str | None, family: str, run: str) -> Path:
     """The decomposer's draft file for one run, inside its run directory.
 
-    ``<runs_root>/<family>/runs/<run>/LEARNING-DRAFT.yaml``, written by the
+    ``<runs root>/<family>/runs/<run>/LEARNING-DRAFT.yaml``, written by the
     chain at SUCCESS closure with ``admitted_by: pending`` and never moved by
-    this service.
+    this service. The runs root follows the repository's registry row
+    (``<repository_path>/.flowrunner``); ``None`` means the father repository and
+    keeps the configured ``runs_root`` default.
     """
-    runs_root = Path(config.get_learning_runs_root()).expanduser()
-    return runs_root / str(family) / "runs" / str(run) / "LEARNING-DRAFT.yaml"
+    return (
+        _repository_runs_root(repository)
+        / str(family)
+        / "runs"
+        / str(run)
+        / "LEARNING-DRAFT.yaml"
+    )
 
 
-def _artifact_path(family: str, run: str) -> Path:
-    return learning_dir() / str(family) / f"{run}.yaml"
+def _artifact_path(repository: str | None, family: str, run: str) -> Path:
+    return learning_dir() / _repository_slug(repository) / str(family) / f"{run}.yaml"
 
 
-def _history_path(family: str, run: str) -> Path:
-    return learning_dir() / "history" / str(family) / f"{run}.yaml"
+def _history_path(repository: str | None, family: str, run: str) -> Path:
+    return (
+        learning_dir()
+        / "history"
+        / _repository_slug(repository)
+        / str(family)
+        / f"{run}.yaml"
+    )
 
 
 def _iter_artifacts(directory: Path) -> list[Path]:
@@ -271,9 +349,11 @@ def _dump_yaml(path: Path, doc: dict) -> None:
     )
 
 
-def _move_to_history(family: str, run: str, extra: dict[str, str]) -> None:
-    """Move ``<family>/<run>.yaml`` into history, writing ``extra`` into it."""
-    source = _artifact_path(family, run)
+def _move_to_history(
+    repository: str | None, family: str, run: str, extra: dict[str, str]
+) -> None:
+    """Move ``<repository>/<family>/<run>.yaml`` into history with ``extra``."""
+    source = _artifact_path(repository, family, run)
     if not source.is_file():
         return
     doc, message = _load_yaml(source)
@@ -282,19 +362,19 @@ def _move_to_history(family: str, run: str, extra: dict[str, str]) -> None:
         doc = {}
     doc = dict(doc)
     doc.update(extra)
-    _dump_yaml(_history_path(family, run), doc)
+    _dump_yaml(_history_path(repository, family, run), doc)
     source.unlink()
 
 
-def _check_run_closed(family: str, run: str) -> str:
+def _check_run_closed(family: str, run: str, repository: str | None = None) -> str:
     """Return an error message when the run is not closed SUCCESS, else ``""``.
 
     Closure is proven by an ``END-REPORT.md`` whose first ``Status`` line
-    contains ``SUCCESS``. A missing runs directory skips the check with a
-    warning (foreign-machine admission); a present directory without proof is
+    contains ``SUCCESS``. The runs directory lives under the repository's own
+    runs root. A missing runs directory skips the check with a warning (foreign-machine admission); a present directory without proof is
     a refusal.
     """
-    runs_root = Path(config.get_learning_runs_root()).expanduser()
+    runs_root = _repository_runs_root(repository)
     run_dir = runs_root / str(family) / "runs" / str(run)
     if not run_dir.is_dir():
         _warn(
@@ -339,9 +419,9 @@ def _status_word(status_line: str) -> str:
     return value or "missing"
 
 
-def _run_status(family: str, run: str) -> str:
+def _run_status(family: str, run: str, repository: str | None = None) -> str:
     """The word from the run's first ``Status`` line, else ``missing``."""
-    report = draft_path(family, run).parent / "END-REPORT.md"
+    report = draft_path(repository, family, run).parent / "END-REPORT.md"
     if not report.is_file():
         return "missing"
     try:
@@ -356,19 +436,27 @@ def _run_status(family: str, run: str) -> str:
     return "missing"
 
 
-def _ledger_line(action: str, family: str, run: str, doc: dict, source: str = "") -> None:
-    """Append one ledger line: stamp, action, family/run, level, admitted_by, source."""
+def _ledger_line(
+    action: str,
+    repository: str | None,
+    family: str,
+    run: str,
+    doc: dict,
+    source: str = "",
+) -> None:
+    """Append one ledger line: stamp, action, repository/family/run, level, ..."""
     validation = doc.get("validation") or {}
     level = validation.get("evidence_level", "") if isinstance(validation, dict) else ""
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     ledger = learning_dir() / "LEDGER.md"
     ledger.parent.mkdir(parents=True, exist_ok=True)
     header_needed = not ledger.is_file()
+    key = f"{_repository_slug(repository)}/{family}/{run}"
     with ledger.open("a", encoding="utf-8") as handle:
         if header_needed:
             handle.write("# Learning Ledger\n\n")
         handle.write(
-            f"- {stamp} | {action} | {family}/{run} | {level} | "
+            f"- {stamp} | {action} | {key} | {level} | "
             f"{doc.get('admitted_by', '')} | source={source}\n"
         )
 
@@ -412,9 +500,10 @@ def admit_document(doc: dict, source: str) -> int:
 
     The document-level half of admission, shared by ``admit`` (which loads a
     given file) and ``admit_run`` (which loads a run's draft in place):
-    validate, prove the run closed SUCCESS, apply ``supersedes``, write the
-    artifact, append one ledger line carrying ``source``, rebuild. The source
-    document itself is never modified or moved.
+    validate, migrate legacy-layout artifacts, prove the run closed SUCCESS,
+    apply ``supersedes``, write the artifact under its repository slug, append
+    one ledger line carrying ``source``, rebuild. The source document itself
+    is never modified or moved.
     """
     violations = validate(doc)
     if violations:
@@ -422,43 +511,66 @@ def admit_document(doc: dict, source: str) -> int:
             print(violation)
         return _fail(f"refusing {source}: {len(violations)} schema violation(s)")
 
+    migrate_legacy_layout()
+
     family = str(doc["family"])
     run = str(doc["run"])
+    repository = _repository_slug(str(doc.get("repository", "")))
 
-    refusal = _check_run_closed(family, run)
+    refusal = _check_run_closed(family, run, repository)
     if refusal:
         return _fail(refusal)
 
+    key = f"{repository}/{family}/{run}"
     for ref in doc.get("supersedes") or []:
         parts = _split_ref(ref)
         if parts is None:
             continue  # validate() already rejected malformed references
-        older_family, older_run = parts
-        _move_to_history(older_family, older_run, {"superseded_by": f"{family}/{run}"})
+        older_repository, older_family, older_run = parts
+        _move_to_history(
+            older_repository or repository,
+            older_family,
+            older_run,
+            {"superseded_by": key},
+        )
 
-    _dump_yaml(_artifact_path(family, run), dict(doc))
-    _ledger_line("admitted", family, run, doc, source)
+    _dump_yaml(_artifact_path(repository, family, run), dict(doc))
+    _ledger_line("admitted", repository, family, run, doc, source)
     return rebuild()
 
 
 def admit_run(ref: str, admitted_by: str) -> int:
     """Admit the draft of one closed run in place; return the exit code.
 
-    ``ref`` is ``"<family>/<run>"``; the draft is read from the run directory
-    (``draft_path``), its ``admitted_by`` is replaced with the admitter's
-    name, and exactly the document-level admission path runs on it. Refusals
-    (exit 1, clean message): a malformed ref, a missing draft, an empty
-    ``admitted_by``, the value ``pending`` in any casing, plus everything
-    ``admit_document`` refuses. The draft file itself is never touched.
+    ``ref`` is ``"<repository>/<family>/<run>"``; the legacy two-part
+    ``"<family>/<run>"`` means the father repository. The draft is read from
+    the run directory (``draft_path``), its ``admitted_by`` is replaced with
+    the admitter's name, and exactly the document-level admission path runs
+    on it. Refusals (exit 1, clean message): a malformed ref, an unknown
+    repository, a missing draft, a draft whose ``repository`` field does not
+    match the repository it was found under, an empty ``admitted_by``, the
+    value ``pending`` in any casing, plus everything ``admit_document``
+    refuses. The draft file itself is never touched.
     """
     parts = _split_ref(ref)
     if parts is None:
-        return _fail(f"reference must be \"family/run\", got {ref!r}")
-    family, run = parts
+        return _fail(
+            f"reference must be \"repository/family/run\" or \"family/run\", "
+            f"got {ref!r}"
+        )
+    named_repository, family, run = parts
+    repository = _repository_slug(named_repository)
+    if named_repository and not _repository_is_known(repository):
+        return _fail(
+            f"unknown repository: {repository};"
+            " register its path with set-repository"
+        )
 
-    artifact = draft_path(family, run)
+    artifact = draft_path(named_repository, family, run)
     if not artifact.is_file():
-        return _fail(f"no draft for {family}/{run}: {artifact} does not exist")
+        return _fail(
+            f"no draft for {repository}/{family}/{run}: {artifact} does not exist"
+        )
 
     name = (admitted_by or "").strip()
     if not name:
@@ -472,6 +584,12 @@ def admit_run(ref: str, admitted_by: str) -> int:
     doc, message = _load_yaml(artifact)
     if doc is None:
         return _fail(message)
+    draft_repository = _repository_slug(str(doc.get("repository", "")))
+    if draft_repository != repository:
+        return _fail(
+            f"draft repository \"{draft_repository}\" does not match "
+            f"repository \"{repository}\""
+        )
     doc = dict(doc)
     doc["admitted_by"] = name
     return admit_document(doc, str(artifact))
@@ -487,12 +605,23 @@ def validate_run(ref: str) -> int:
     """
     parts = _split_ref(ref)
     if parts is None:
-        return _fail(f"reference must be \"family/run\", got {ref!r}")
-    family, run = parts
+        return _fail(
+            f"reference must be \"repository/family/run\" or \"family/run\", "
+            f"got {ref!r}"
+        )
+    named_repository, family, run = parts
+    repository = _repository_slug(named_repository)
+    if named_repository and not _repository_is_known(repository):
+        return _fail(
+            f"unknown repository: {repository};"
+            " register its path with set-repository"
+        )
 
-    artifact = draft_path(family, run)
+    artifact = draft_path(named_repository, family, run)
     if not artifact.is_file():
-        return _fail(f"no draft for {family}/{run}: {artifact} does not exist")
+        return _fail(
+            f"no draft for {repository}/{family}/{run}: {artifact} does not exist"
+        )
     doc, message = _load_yaml(artifact)
     if doc is None:
         return _fail(message)
@@ -500,31 +629,47 @@ def validate_run(ref: str) -> int:
     violations = validate(doc)
     for violation in violations:
         print(violation)
-    print(f"run status: {_run_status(family, run)}")
+    print(f"run status: {_run_status(family, run, repository)}")
     return 0 if not violations else 1
 
 
 def retract(ref: str) -> int:
     """Retract one admitted artifact; return the process exit code.
 
-    The artifact moves to history with ``retracted_at`` written into it and
-    the manifests and scopes are rebuilt; history stays retrievable through
-    ``include_history=true``.
+    ``ref`` takes the same three-part (or legacy two-part) form as the other
+    learning commands. The artifact moves to history with ``retracted_at``
+    written into it and the manifests and scopes are rebuilt; history stays
+    retrievable through ``include_history=true``. Legacy-layout artifacts are
+    migrated first, so the retraction finds them under their repository slug.
     """
     parts = _split_ref(ref)
     if parts is None:
-        return _fail(f"reference must be \"family/run\", got {ref!r}")
-    family, run = parts
-    source = _artifact_path(family, run)
+        return _fail(
+            f"reference must be \"repository/family/run\" or \"family/run\", "
+            f"got {ref!r}"
+        )
+    named_repository, family, run = parts
+    repository = _repository_slug(named_repository)
+    if named_repository and not _repository_is_known(repository):
+        return _fail(
+            f"unknown repository: {repository};"
+            " register its path with set-repository"
+        )
+
+    migrate_legacy_layout()
+    source = _artifact_path(repository, family, run)
     if not source.is_file():
-        return _fail(f"no admitted artifact for {family}/{run} under {learning_dir()}")
+        return _fail(
+            f"no admitted artifact for {repository}/{family}/{run} "
+            f"under {learning_dir()}"
+        )
     doc, message = _load_yaml(source)
     if doc is None:
         return _fail(message)
 
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    _move_to_history(family, run, {"retracted_at": stamp})
-    _ledger_line("retracted", family, run, doc, str(source))
+    _move_to_history(repository, family, run, {"retracted_at": stamp})
+    _ledger_line("retracted", repository, family, run, doc, str(source))
     return rebuild()
 
 
@@ -532,11 +677,13 @@ def list_artifact_records(history: bool = False) -> list[dict]:
     """Return one plain dict per artifact, newest listing data first.
 
     Live artifacts come from the learning directory, history artifacts from
-    its ``history`` subtree. Every record carries ``family``, ``run``,
+    its ``history`` subtree. Every record carries ``repository`` (the slug of
+    the artifact's repository), ``family``, ``run``,
     ``topic``, ``evidence_level``, ``confidence``, ``admitted_by`` and
     ``supersedes`` (a list); history records additionally carry
     ``superseded_by`` and ``retracted_at`` as string or ``None``. Sorted by
-    ``family``, then ``run``. Pure read: nothing is written or rebuilt.
+    ``repository``, then ``family``, then ``run``. Pure read: nothing is
+    written or rebuilt.
     """
     directory = learning_dir()
     if history:
@@ -550,6 +697,7 @@ def list_artifact_records(history: bool = False) -> list[dict]:
         validation = doc.get("validation") or {}
         level = validation.get("evidence_level", "") if isinstance(validation, dict) else ""
         record = {
+            "repository": _repository_slug(str(doc.get("repository", ""))),
             "family": str(doc.get("family", "")),
             "run": str(doc.get("run", "")),
             "topic": str(doc.get("topic", "")),
@@ -566,15 +714,16 @@ def list_artifact_records(history: bool = False) -> list[dict]:
                 str(doc["retracted_at"]) if doc.get("retracted_at") else None
             )
         records.append(record)
-    records.sort(key=lambda item: (item["family"], item["run"]))
+    records.sort(key=lambda item: (item["repository"], item["family"], item["run"]))
     return records
 
 
 def list_artifacts() -> int:
-    """Print one line per admitted artifact: family/run, topic, level, etc."""
+    """Print one line per artifact: repository/family/run, topic, level, etc."""
     for record in list_artifact_records():
         print(
-            f"{record['family']}/{record['run']}\t{record['topic']}\t"
+            f"{record['repository']}/{record['family']}/{record['run']}\t"
+            f"{record['topic']}\t"
             f"{record['evidence_level']}\t{record['confidence']}\t"
             f"{record['admitted_by']}"
         )
@@ -584,59 +733,75 @@ def list_artifacts() -> int:
 def list_pending_drafts() -> list[dict]:
     """Return one plain dict per run-directory draft, newest listing first.
 
-    Scans ``<runs_root>/*/runs/*/LEARNING-DRAFT.yaml``; every record carries
-    ``family``, ``run``, ``topic``, ``evidence_level``, ``run_status`` (the
-    word from the run's END-REPORT, ``missing`` when there is none),
-    ``admitted`` (an artifact for that ``family/run`` exists under the
-    learning directory or its history), ``valid`` and ``violations`` (the
-    number of schema violations). Sorted by ``family``, then ``run``. A draft
-    that does not parse is listed with ``valid`` false, one violation and an
-    empty topic. A missing runs root is an empty list. Pure read: nothing is
-    written or rebuilt.
+    Scans ``<runs root>/*/runs/*/LEARNING-DRAFT.yaml`` under every registered
+    repository's runs root (``<repository_path>/.flowrunner``), then under
+    the father repository's configured ``runs_root`` when it has no registry
+    row. Every record carries ``repository`` (the slug the draft was found
+    under), ``family``, ``run``, ``topic``, ``evidence_level``,
+    ``run_status`` (the word from the run's END-REPORT, ``missing`` when there
+    is none), ``admitted`` (an artifact for that ``repository/family/run``
+    exists under the learning directory or its history), ``valid`` and
+    ``violations`` (the number of schema violations). Sorted by ``family``,
+    then ``run``, then ``repository``. A draft that does not parse is listed
+    with ``valid`` false, one violation and an empty topic. Missing runs roots
+    contribute nothing. Pure read: nothing is written or rebuilt.
     """
-    runs_root = Path(config.get_learning_runs_root()).expanduser()
-    if not runs_root.is_dir():
-        return []
+    roots: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for scope, location in _registry_rows():
+        roots.append((scope, Path(location).expanduser() / ".flowrunner"))
+        seen.add(scope)
+    father = config.get_scope()
+    if father not in seen:
+        roots.append(
+            (father, Path(config.get_learning_runs_root()).expanduser())
+        )
 
     drafts: list[dict] = []
-    for artifact in runs_root.glob("*/runs/*/LEARNING-DRAFT.yaml"):
-        parts = artifact.relative_to(runs_root).parts
-        family, run = str(parts[0]), str(parts[2])
-        record: dict = {
-            "family": family,
-            "run": run,
-            "topic": "",
-            "evidence_level": "",
-            "run_status": _run_status(family, run),
-            "admitted": (
-                _artifact_path(family, run).is_file()
-                or _history_path(family, run).is_file()
-            ),
-        }
-        doc, message = _load_yaml(artifact)
-        if doc is None:
-            _warn(message)
-            record.update({"topic": "", "valid": False, "violations": 1})
-            drafts.append(record)
+    for repository, runs_root in roots:
+        if not runs_root.is_dir():
             continue
-        violations = validate(doc)
-        validation = doc.get("validation") or {}
-        level = (
-            validation.get("evidence_level", "")
-            if isinstance(validation, dict)
-            else ""
-        )
-        record.update(
-            {
-                "topic": str(doc.get("topic", "")),
-                "evidence_level": str(level),
-                "valid": not violations,
-                "violations": len(violations),
+        for artifact in runs_root.glob("*/runs/*/LEARNING-DRAFT.yaml"):
+            parts = artifact.relative_to(runs_root).parts
+            family, run = str(parts[0]), str(parts[2])
+            record: dict = {
+                "repository": repository,
+                "family": family,
+                "run": run,
+                "topic": "",
+                "evidence_level": "",
+                "run_status": _run_status(family, run, repository),
+                "admitted": (
+                    _artifact_path(repository, family, run).is_file()
+                    or _history_path(repository, family, run).is_file()
+                ),
             }
-        )
-        drafts.append(record)
+            doc, message = _load_yaml(artifact)
+            if doc is None:
+                _warn(message)
+                record.update({"topic": "", "valid": False, "violations": 1})
+                drafts.append(record)
+                continue
+            violations = validate(doc)
+            validation = doc.get("validation") or {}
+            level = (
+                validation.get("evidence_level", "")
+                if isinstance(validation, dict)
+                else ""
+            )
+            record.update(
+                {
+                    "topic": str(doc.get("topic", "")),
+                    "evidence_level": str(level),
+                    "valid": not violations,
+                    "violations": len(violations),
+                }
+            )
+            drafts.append(record)
 
-    drafts.sort(key=lambda item: (item["family"], item["run"]))
+    drafts.sort(
+        key=lambda item: (item["family"], item["run"], item["repository"])
+    )
     return drafts
 
 
@@ -644,13 +809,62 @@ def print_drafts() -> int:
     """Print one tab-separated line per draft awaiting or holding admission."""
     for record in list_pending_drafts():
         print(
-            f"{record['family']}/{record['run']}\t{record['topic']}\t"
+            f"{record['repository']}/{record['family']}/{record['run']}\t"
+            f"{record['topic']}\t"
             f"{record['evidence_level']}\t{record['run_status']}\t"
             f"{'admitted' if record['admitted'] else 'pending'}\t"
             f"{'valid' if record['valid'] else 'invalid'}\t"
             f"{record['violations']}"
         )
     return 0
+
+
+# ── migration ───────────────────────────────────────────────────────────
+
+
+def migrate_legacy_layout() -> int:
+    """Move legacy two-part artifacts under their repository slug once.
+
+    Legacy files sat at ``<learning_dir>/<family>/<run>.yaml`` and their
+    history twins at ``<learning_dir>/history/<family>/<run>.yaml``; the
+    three-part layout puts each under the slug of its ``repository`` field.
+    Every moved artifact gets exactly one ``migrated`` ledger line; the next
+    call finds nothing left to move, so the migration is idempotent. Broken
+    documents are skipped with a warning. Returns the number of moved files.
+    """
+    directory = learning_dir()
+    moved = 0
+    bases: tuple[tuple[Path, bool], ...] = (
+        (directory, False),
+        (directory / "history", True),
+    )
+    for base, is_history in bases:
+        if not base.is_dir():
+            continue
+        for artifact in sorted(base.glob("*/*.yaml"), key=str):
+            parts = artifact.relative_to(base).parts
+            if parts[0] == "history" and not is_history:
+                continue
+            doc, message = _load_yaml(artifact)
+            if doc is None:
+                _warn(message)
+                continue
+            repository = _repository_slug(str(doc.get("repository", "")))
+            family = str(doc.get("family", parts[0]))
+            run = str(doc.get("run", artifact.stem))
+            target = (
+                _history_path(repository, family, run)
+                if is_history
+                else _artifact_path(repository, family, run)
+            )
+            if target == artifact:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(artifact.read_bytes())
+            artifact.unlink()
+            _ledger_line("migrated", repository, family, run, doc, str(artifact))
+            moved += 1
+    return moved
 
 
 # ── manifests ───────────────────────────────────────────────────────────
@@ -722,7 +936,8 @@ def _artifact_records(directory: Path, scope_name: str) -> list[dict]:
         if doc is None:
             _warn(message)
             continue
-        path = f"{doc.get('family', '')}/{doc.get('run', '')}.yaml"
+        repository = _repository_slug(str(doc.get("repository", "")))
+        path = f"{repository}/{doc.get('family', '')}/{doc.get('run', '')}.yaml"
         metadata = _passage_metadata(doc, scope_name, path)
         if scope_name == "experience-history":
             metadata = _history_extra(doc, metadata)
@@ -750,8 +965,12 @@ def _ecosystem_records(directory: Path) -> list[dict]:
             for item in (doc.get("architecture_implications") or [])
             if str(item).strip()
         ]
-        path = f"{doc.get('family', '')}/{doc.get('run', '')}.yaml"
-        origin = f"{doc.get('family', '')}/{doc.get('run', '')}/{doc.get('topic', '')}"
+        repository = _repository_slug(str(doc.get("repository", "")))
+        path = f"{repository}/{doc.get('family', '')}/{doc.get('run', '')}.yaml"
+        origin = (
+            f"{repository}/{doc.get('family', '')}/{doc.get('run', '')}/"
+            f"{doc.get('topic', '')}"
+        )
         for index, implication in enumerate(implications, 1):
             metadata = _passage_metadata(doc, "ecosystem", f"{path}#{index}")
             metadata["origin"] = origin
@@ -790,7 +1009,12 @@ def build_manifests() -> dict[str, int]:
 
 
 def rebuild() -> int:
-    """Rebuild the learning manifests and refresh their three scopes."""
+    """Rebuild the learning manifests and refresh their three scopes.
+
+    Legacy-layout artifacts are migrated first, so the manifests are always
+    rebuilt from the three-part layout.
+    """
+    migrate_legacy_layout()
     counts = build_manifests()
     directory = learning_dir()
     for scope in LEARNING_SCOPES:

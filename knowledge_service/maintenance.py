@@ -14,13 +14,15 @@ provider-neutral interface only. It never imports, names, or otherwise
 depends on a concrete provider; a concrete provider is resolved at runtime
 through ``knowledge_service.search.resolve_provider``.
 
-``location`` recorded on a registry row is the repository path, not the
-manifest path: the manifest is always ``<index_dir>/<scope>.jsonl`` and is
-re-derived from config, while the repository path is what
-``refresh-all --from-registry`` needs to find the tree again. Rows imported
-from another registry keep whatever location they came with; a location that
-is not a directory is skipped by ``refresh-all`` until one ``refresh``
-records the repository path.
+A registry row separates two facts. ``repository_path`` is the repository
+directory itself: ``refresh`` records the resolved path there, and both
+``refresh-all --from-registry`` and the learning runs roots read it.
+``location`` keeps whatever the caller recorded — imported rows carry the
+manifest path of their source registry, rows this service wrote directly
+carry the repository directory — and ``refresh-all`` falls back to it only
+when ``repository_path`` is empty and it holds a directory. Otherwise the
+command names the missing ``repository_path`` and points at
+``set-repository``.
 
 Read-only toward the scanned repository: the only writes are this service's
 database (``knowledge_indexes`` upsert) and temp files the capability probe
@@ -165,12 +167,17 @@ def detect_changes(repo, scope, manifest_path) -> MaintenancePlan:
     )
 
 
-def record_index(scope, provider, location, document_count, status) -> None:
+def record_index(
+    scope, provider, location, document_count, status, repository_path=""
+) -> None:
     """Upsert one ``knowledge_indexes`` row for ``scope``.
 
     This service owns its database, so the schema is ensured before the
     upsert. SQL is parameterized only, and ``scope``'s UNIQUE constraint
     makes a repeated call an update instead of a duplicate row.
+    ``repository_path`` is the repository directory of the row; callers that
+    record a manifest-driven learning scope leave it empty, and an empty
+    value never erases a path an earlier ``refresh`` recorded.
     """
     if isinstance(document_count, bool) or not isinstance(document_count, int):
         _fail("document_count must be an integer")
@@ -186,15 +193,18 @@ def record_index(scope, provider, location, document_count, status) -> None:
     try:
         conn.execute(
             "INSERT INTO knowledge_indexes "
-            "(scope, provider, location, document_count, status) "
-            "VALUES (?, ?, ?, ?, ?) "
+            "(scope, provider, location, document_count, status, repository_path) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(scope) DO UPDATE SET "
             "provider = excluded.provider, "
             "location = excluded.location, "
             "document_count = excluded.document_count, "
             "status = excluded.status, "
+            "repository_path = CASE "
+            "WHEN excluded.repository_path <> '' THEN excluded.repository_path "
+            "ELSE knowledge_indexes.repository_path END, "
             "updated_at = datetime('now')",
-            (scope, provider, location, document_count, status),
+            (scope, provider, location, document_count, status, repository_path),
         )
         conn.commit()
     finally:
@@ -255,7 +265,7 @@ def refresh_scope(scope: str, repo_path: str) -> dict:
     a noop result without touching the indexer/provider/registry when
     nothing changed, otherwise run the indexer, count the manifest lines, let
     the provider index the new manifest, and record one ``knowledge_indexes``
-    row whose ``location`` is the repository path.
+    row whose ``repository_path`` is the resolved repository directory.
 
     Exceptions are never caught into a return value here:
     ``ProviderNotReady``, ``RepoExclusionError``, ``OSError``, and the
@@ -295,6 +305,7 @@ def refresh_scope(scope: str, repo_path: str) -> dict:
         str(Path(repo_path).expanduser().resolve()),
         document_count,
         plan.status,
+        repository_path=str(Path(repo_path).expanduser().resolve()),
     )
 
     return {

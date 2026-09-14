@@ -20,7 +20,7 @@ Base path `/v1`. When `[service] token` is set, every route except
 |---|---|---|---|
 | GET | `/v1/search` | `q`, `scope`, `top_k`, `token_budget`, `agent_role`, `flow_key`, `run_id`, `handoff_id` | Search one scope, record the retrieval |
 | POST | `/v1/refresh` | body `{"scope": ..., "repo_path": ...}` | Re-index a scope when its repository changed |
-| GET | `/v1/scopes` | — | List registered scopes with document counts |
+| GET | `/v1/scopes` | — | List registered scopes with document counts and repository paths |
 | GET | `/v1/learning` | `history` | List admitted learning artifacts (`history=true` for the older ones) |
 | GET | `/v1/scope-for-path` | `path` | Resolve a repository path to its scope slug |
 | GET | `/v1/health` | — | Provider, enabled flag, preflight result |
@@ -160,9 +160,16 @@ Bring the registry over once, then index what the registry names:
 
 `import-registry` copies `knowledge_indexes`, `knowledge_scope_grants`,
 `knowledge_retrieval_log` and `knowledge_exclusions` once, keeping the
-original ids, so re-running it changes nothing. Imported rows keep the
-location they came with; a row whose path no longer exists is skipped until a
-`refresh` records a directory again. Point `--from` at the live database file
+original ids, so re-running it changes nothing. Imported rows keep the location
+they came with (the manifest path of their source registry) and leave
+`repository_path` empty. Every `refresh` records the resolved repository
+directory on the row's `repository_path`; `GET /v1/scopes` carries it, the
+learning runs root hangs off it (`<repository_path>/.flowrunner`), and an
+imported row gets the path through `set-repository <scope> <path>`.
+`refresh-all --from-registry` refreshes rows whose `repository_path` is a
+directory — or whose empty `repository_path` pairs with a directory
+`location` — and skips the rest with a message naming the missing
+`repository_path` and the command. Point `--from` at the live database file
 itself (`~/DPMtF-WebUI/databases/dpmtf.db`) so its `dpmtf.db-wal` sibling is
 read along with it; a copy of only the main file can miss the most recent
 commits, including freshly recorded grants.
@@ -289,11 +296,20 @@ learned: `experience` (validated learning artifacts), `ecosystem` (the
 architecture implications promoted out of them), and `experience-history`
 (the superseded and retracted ones). They are built from manifests, not
 from a repository scan, and every artifact is a YAML document under
-`<learning_dir>/<family>/<run>.yaml` — `topic`, `problem`, `approach`,
-`result`, `failed_approaches`, `important_files` (repository-relative,
-forward slashes), `architecture_implications`, `confidence`, and a
-`validation` block. Roles draft artifacts inside their chains; the
-supervisor admits them — no model is involved in admission.
+`<learning_dir>/<repository>/<family>/<run>.yaml`. The identity is the
+three-part key `<repository>/<family>/<run>`, where `<repository>` is the
+artifact's repository normalised to the scope slug of `/v1/scope-for-path`
+(`DPMtF-WebUI` → `dpmtf-webui`, `FlowRunner` → `flowrunner`), so two
+repositories sharing a family number never overwrite each other. History
+lives at `<learning_dir>/history/<repository>/<family>/<run>.yaml`. An
+artifact still sitting at the legacy `<learning_dir>/<family>/<run>.yaml`
+(or its history twin) is moved under its slug once — on `learning rebuild`
+and on every admit — with one `migrated` ledger line each; manifests are
+always rebuilt from the new layout. Every document carries `topic`,
+`problem`, `approach`, `result`, `failed_approaches`, `important_files`
+(repository-relative, forward slashes), `architecture_implications`,
+`confidence`, and a `validation` block. Roles draft artifacts inside their
+chains; the supervisor admits them — no model is involved in admission.
 
 Evidence levels order by strength: `tests`, `measured_runtime`,
 `approved_architecture`, `reviewer_conclusion`, `observation`
@@ -311,22 +327,29 @@ python -m knowledge_service.cli learning validate draft.yaml
 # admit a closed SUCCESS run: writes the artifact, applies supersedes,
 # rebuilds both scopes and their manifests
 python -m knowledge_service.cli learning admit draft.yaml
-# the same admission straight from the run directory, naming the admitter
+# the same admission straight from the run directory, naming the admitter;
+# refs are three-part — the legacy two-part form means the father repository
+python -m knowledge_service.cli learning admit-run dpmtf-webui/2000/041 --admitted-by svend
 python -m knowledge_service.cli learning admit-run 2000/041 --admitted-by svend
 # one run draft's violations plus its END-REPORT status, without admitting
-python -m knowledge_service.cli learning validate-run 2000/041
-python -m knowledge_service.cli learning drafts
-python -m knowledge_service.cli learning retract 2000/029
+python -m knowledge_service.cli learning validate-run flowrunner/2000/041
+python -m knowledge_service.cli learning drafts    # lists every registered repository
+python -m knowledge_service.cli learning retract dpmtf-webui/2000/029
 python -m knowledge_service.cli learning list
 python -m knowledge_service.cli learning rebuild
 ```
 
 Admission refuses (exit 1, clean message) a failing schema check, a
 `hypothesis` level, or a run that is not closed SUCCESS — proven by an
-`END-REPORT.md` whose first `Status` line contains `SUCCESS` under
-`[learning] runs_root` (default: `.flowrunner` beside the installation's
-father root; a missing runs directory skips the check with a warning, so a
-foreign machine can still admit by hand). The status line may carry Markdown
+`END-REPORT.md` whose first `Status` line contains `SUCCESS` under the
+repository's own runs root — `<repository_path>/.flowrunner` beside the
+directory its registry row records, through `refresh` or `set-repository`;
+the rows `GET /v1/scopes` lists. `[learning] runs_root` stays
+the father repository's default only, and an unregistered repository whose
+slug is not the father's is reported `unknown repository` naming
+`set-repository`. With no runs
+directory present the check is skipped with a warning, so a foreign machine
+can still admit by hand. The status line may carry Markdown
 bold — `**Status:** SUCCESS` and `**Status: SUCCESS** — run closed.` both
 prove closure, decoration before the word is ignored. Superseding and retracting move
 the older artifact to `<learning_dir>/history/...` with `superseded_by` /
@@ -339,20 +362,27 @@ store behind, and searching an emptied learning scope answers with an empty
 result list instead of reaching the provider.
 
 The supervisor admits with
-`learning admit-run <family>/<run> --admitted-by <name>`: the draft is read
-from `<runs_root>/<family>/runs/<run>/LEARNING-DRAFT.yaml`, its
-`admitted_by` is replaced with the name (the placeholder `pending` itself is
-refused, as is an empty name), and exactly the `learning admit` path runs on
-that document — the draft file itself is never modified or moved.
-`learning validate-run <family>/<run>` prints the same draft's violations
-plus one `run status: <SUCCESS|BLOCKED|…|missing>` line from the END-REPORT's
-first `Status` line (`missing` when there is none) and never admits.
-`learning drafts` lists every run-directory draft, one tab-separated line
-each (`family/run`, topic, evidence level, run status, admitted/pending,
-valid/invalid, violation count, sorted by family then run), and
-`GET /v1/learning/drafts` answers that list as `{"drafts": [...]}` — read-only,
-no scope guard, like `/v1/learning`; `?pending=true` keeps only the drafts
-whose artifact is not admitted yet. Every ledger line carries a sixth column
+`learning admit-run <repository>/<family>/<run> --admitted-by <name>` (the
+legacy two-part `<family>/<run>` means the father repository): the draft is
+read from `<runs root>/<family>/runs/<run>/LEARNING-DRAFT.yaml` inside that
+repository's runs root, its `admitted_by` is replaced with the name (the
+placeholder `pending` itself is refused, as is an empty name), and exactly
+the `learning admit` path runs on that document — the draft file itself is
+never modified or moved. A draft whose `repository` field does not match the
+repository it was found under is refused.
+`learning validate-run <repository>/<family>/<run>` prints the same draft's
+violations plus one `run status: <SUCCESS|BLOCKED|…|missing>` line from the
+END-REPORT's first `Status` line (`missing` when there is none) and never
+admits.
+`learning drafts` lists every run-directory draft under every registered
+repository, one tab-separated line each (`repository/family/run`, topic,
+evidence level, run status, admitted/pending, valid/invalid, violation
+count, sorted by family then run), and `GET /v1/learning/drafts` answers
+that list as `{"drafts": [...]}` — read-only, no scope guard, like
+`/v1/learning`; `?pending=true` keeps only the drafts whose artifact is not
+admitted yet. `GET /v1/learning` rows carry `repository`, and
+`GET /v1/learning?repository=<slug>` filters them to one repository. Every
+ledger line carries a sixth column
 `source=<path>` naming where the admitted artifact came from: the draft path
 for `admit-run`, the given file path for `admit`.
 
