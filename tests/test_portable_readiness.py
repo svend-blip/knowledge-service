@@ -1,6 +1,6 @@
 """Windows-readiness proofs for the portable provider path.
 
-Four named proofs, runnable wherever Python and the portable requirements
+Six named proofs, runnable wherever Python and the portable requirements
 run (hermetic: temporary directories only, fake embedders, no network):
 
 1. the package imports and builds its app without ``leann``,
@@ -10,11 +10,18 @@ run (hermetic: temporary directories only, fake embedders, no network):
 3. building a three-document manifest and searching it round-trips through
    the real SQLite store with a fake embedder;
 4. the parity script reports an unavailable provider in its summary instead
-   of raising.
+   of raising;
+5. the parity run-scoped INI inherits every operator key except the three
+   it overrides;
+6. each parity row carries that query's own latency, and the summary the
+   mean across queries;
+7. a provider whose build raises after a passing preflight is reported as
+   ``failed``, the other provider still completes, and the exit code is 0.
 """
 
 from __future__ import annotations
 
+import configparser
 import importlib.util
 import json
 import subprocess
@@ -229,3 +236,176 @@ def test_parity_script_reports_an_unavailable_provider_instead_of_raising(
     assert exit_code == 0
     assert "unavailable: no GPU" in printed
     assert "summary queries=2" in printed
+
+
+def test_parity_ini_inherits_the_operator_settings(tmp_path, monkeypatch):
+    """The run-scoped INI carries the operator's keys, plus three overrides."""
+    base = tmp_path / "knowledge.ini"
+    base.write_text(
+        "[knowledge]\n"
+        "enabled = true\n"
+        "provider = leann\n"
+        "min_free_vram_mib = 1234\n"
+        "leann_use_daemon = false\n"
+        "\n"
+        "[service]\n"
+        "token = operator-token\n"
+        "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KNOWLEDGE_SERVICE_INI", str(base))
+
+    parity = _parity_module()
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+    written = parity._write_ini(index_dir, "portable")
+
+    parser = configparser.ConfigParser()
+    parser.read(written, encoding="utf-8")
+    assert parser.get("knowledge", "min_free_vram_mib") == "1234"
+    assert parser.get("knowledge", "leann_use_daemon") == "false"
+    assert parser.get("knowledge", "provider") == "portable"
+    assert parser.get("knowledge", "index_dir") == str(index_dir)
+    assert parser.get("service", "db_path") == str(index_dir / "parity-registry.db")
+
+
+def test_parity_rows_carry_per_query_latencies(tmp_path, monkeypatch):
+    """Each row is that query's own measurement; the summary is their mean."""
+
+    class FixedClock:
+        def __init__(self, values):
+            self._values = iter(values)
+
+        def perf_counter(self):
+            return next(self._values)
+
+    class TimedProvider:
+        def __init__(self, **kwargs):
+            pass
+
+        def preflight(self):
+            return None
+
+        def index(self, source):
+            return None
+
+        def update(self, source):
+            return None
+
+        def remove(self, source):
+            return None
+
+        def search(self, query, *, scope=None, filters=None, top_k=None,
+                   token_budget=None):
+            return [{"path": "notes.md", "score": 1.0}]
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "notes.md").write_text("# Notes\nalpha bravo bridge\n", encoding="utf-8")
+
+    monkeypatch.setattr(search, "resolve_provider", lambda name, scope=None: TimedProvider)
+    parity = _parity_module()
+    # Per provider run: build start/end, then two query measurements. The
+    # first query takes 1 s of clock, the second 2 s, on both providers.
+    monkeypatch.setattr(
+        parity, "time", FixedClock([1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 14])
+    )
+
+    report = parity.parity_report(
+        "alpha", str(repo), ["alpha", "bravo"], index_dir=tmp_path / "index", top_k=2
+    )
+
+    rows = report["rows"]
+    assert rows[0]["leann_ms"] == pytest.approx(1000.0)
+    assert rows[1]["leann_ms"] == pytest.approx(2000.0)
+    assert rows[0]["leann_ms"] != rows[1]["leann_ms"]
+    assert rows[0]["portable_ms"] == pytest.approx(1000.0)
+    assert rows[1]["portable_ms"] == pytest.approx(2000.0)
+
+    providers = report["summary"]["providers"]
+    assert providers["leann"]["mean_ms"] == pytest.approx(1500.0)
+    assert providers["portable"]["mean_ms"] == pytest.approx(1500.0)
+
+
+def test_parity_reports_a_provider_that_fails_during_build(
+    tmp_path, monkeypatch, capsys
+):
+    """A raising build becomes `failed: <class>: <line>`; the other side prints."""
+
+    class BuildFailLeann:
+        def __init__(self, **kwargs):
+            pass
+
+        def preflight(self):
+            return None
+
+        def index(self, source):
+            raise RuntimeError("boom")
+
+        def update(self, source):
+            raise RuntimeError("boom")
+
+        def remove(self, source):
+            return None
+
+        def search(self, query, *, scope=None, filters=None, top_k=None,
+                   token_budget=None):
+            return []
+
+    class OkPortable:
+        def __init__(self, **kwargs):
+            pass
+
+        def preflight(self):
+            return None
+
+        def index(self, source):
+            return None
+
+        def update(self, source):
+            return None
+
+        def remove(self, source):
+            return None
+
+        def search(self, query, *, scope=None, filters=None, top_k=None,
+                   token_budget=None):
+            return [{"path": "notes.md", "score": 1.0}]
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "notes.md").write_text("# Notes\nalpha bravo bridge\n", encoding="utf-8")
+    queries = tmp_path / "queries.txt"
+    queries.write_text("alpha\nbravo\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        search,
+        "resolve_provider",
+        lambda name, scope=None: BuildFailLeann
+        if name == "leann"
+        else OkPortable,
+    )
+
+    parity = _parity_module()
+    exit_code = parity.main(
+        [
+            "--scope", "alpha",
+            "--repo", str(repo),
+            "--queries", str(queries),
+            "--index-dir", str(tmp_path / "index"),
+            "--top-k", "2",
+            "--json",
+        ]
+    )
+    printed = capsys.readouterr().out
+
+    assert exit_code == 0
+    report = json.loads(printed)
+    providers = report["summary"]["providers"]
+    assert providers["leann"]["failed"] == "RuntimeError: boom"
+    assert "mean_ms" in providers["portable"]
+    rows = report["rows"]
+    assert len(rows) == 2
+    assert all(row["portable_top"] == ["notes.md"] for row in rows)
+    assert all(row["leann_top"] == [] for row in rows)
+

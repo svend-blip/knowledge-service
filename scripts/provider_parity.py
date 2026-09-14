@@ -14,10 +14,14 @@ provider, the build seconds and the store size per provider. ``--json``
 prints the same data as one JSON document.
 
 A provider whose preflight fails (no GPU, no model files) is reported in the
-summary as ``unavailable: <detail>`` and its columns stay empty; the script
-never raises for that. Everything is written under ``--index-dir`` (a temp
-directory by default): manifests, both stores and the temp registry database.
-The shared index directory and the real registry are never touched.
+summary as ``unavailable: <detail>`` and its columns stay empty; a provider
+whose build or search raises after a passing preflight is reported as
+``failed: <exception class>: <first line>``, also with empty columns, and
+the other provider's rows and summary still print. The script never raises
+for either; it exits 0 when at least one provider completed and 2 when none
+did. Everything is written under ``--index-dir`` (a temp directory by
+default): manifests, both stores and the temp registry database. The shared
+index directory and the real registry are never touched.
 
 Usage::
 
@@ -29,6 +33,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import configparser
 import json
 import os
 import sys
@@ -69,23 +74,30 @@ def jaccard(first: list[str], second: list[str]) -> float:
 def _write_ini(index_dir: Path, provider_key: str) -> str:
     """Write one run-scoped INI into ``index_dir`` and point the env at it.
 
-    The INI keeps every path inside ``index_dir``: the index dir itself and
-    the registry database both live there, so a parity run leaves the shared
-    index directory and the real registry untouched.
+    The run starts from the operator's configured INI — the one ``config``
+    resolves from ``KNOWLEDGE_SERVICE_INI`` or its default location, or the
+    packaged defaults when no file exists — and overrides exactly three
+    keys: ``provider``, the ``index_dir`` (always ``index_dir``) and the
+    ``db_path`` (a temp registry beside it). Every other operator setting —
+    ``min_free_vram_mib``, ``leann_use_daemon``, ``top_k``, the token and
+    character budgets, the ``[portable]`` section — carries over unchanged,
+    so a preflight on a host with a resident model sees the operator's own
+    limits instead of a from-scratch file.
     """
-    ini_path = index_dir / f"parity-{provider_key}.ini"
+    parser = configparser.ConfigParser()
+    base = config.ini_path()
+    if base:
+        parser.read(base, encoding="utf-8")
     registry = index_dir / "parity-registry.db"
-    lines = [
-        "[knowledge]",
-        "enabled = true",
-        f"provider = {provider_key}",
-        f"index_dir = {index_dir}",
-        "",
-        "[service]",
-        f"db_path = {registry}",
-        "",
-    ]
-    ini_path.write_text("\n".join(lines), encoding="utf-8")
+    parser.read_dict(
+        {
+            "knowledge": {"provider": provider_key, "index_dir": str(index_dir)},
+            "service": {"db_path": str(registry)},
+        }
+    )
+    ini_path = index_dir / f"parity-{provider_key}.ini"
+    with ini_path.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
     os.environ[config.ENV_INI_PATH] = str(ini_path)
     config.reload()
     return str(ini_path)
@@ -109,6 +121,13 @@ def _store_size_bytes(index_dir: Path, scope: str) -> int:
     return total
 
 
+def _failure_text(exc: Exception) -> str:
+    """One-line failure summary: exception class plus the message's first line."""
+    lines = str(exc).splitlines()
+    detail = lines[0] if lines else ""
+    return f"{type(exc).__name__}: {detail}"
+
+
 def _run_provider(
     provider_key: str,
     scope: str,
@@ -120,10 +139,11 @@ def _run_provider(
     """Build the scope once and time every query against it."""
     outcome: dict = {
         "top": {query: [] for query in queries},
-        "latencies_ms": [],
+        "latency_ms": {},
         "build_seconds": 0.0,
         "store_bytes": 0,
         "unavailable": None,
+        "failed": None,
     }
     _write_ini(index_dir, provider_key)
 
@@ -132,6 +152,9 @@ def _run_provider(
         maintenance.refresh_scope(scope, repo_path)
     except ProviderNotReady as exc:
         outcome["unavailable"] = str(exc)
+        return outcome
+    except Exception as exc:
+        outcome["failed"] = _failure_text(exc)
         return outcome
     outcome["build_seconds"] = time.perf_counter() - started
 
@@ -142,16 +165,18 @@ def _run_provider(
         for query in queries:
             started = time.perf_counter()
             results = provider.search(query, scope=scope, top_k=top_k)
-            outcome["latencies_ms"].append(
-                (time.perf_counter() - started) * 1000.0
-            )
+            outcome["latency_ms"][query] = (time.perf_counter() - started) * 1000.0
             outcome["top"][query] = [
                 str(result.get("path", "")) for result in results
             ]
     except ProviderNotReady as exc:
         outcome["unavailable"] = str(exc)
         outcome["top"] = {query: [] for query in queries}
-        outcome["latencies_ms"] = []
+        outcome["latency_ms"] = {}
+    except Exception as exc:
+        outcome["failed"] = _failure_text(exc)
+        outcome["top"] = {query: [] for query in queries}
+        outcome["latency_ms"] = {}
 
     outcome["store_bytes"] = _store_size_bytes(index_dir, scope)
     return outcome
@@ -171,8 +196,8 @@ def parity_report(
     ``{"query", "leann_top", "portable_top", "jaccard", "leann_ms",
     "portable_ms"}``; the summary holds the mean Jaccard, the mean latency,
     the build seconds and the store size per provider, or the provider's
-    ``unavailable`` detail when its preflight failed. Never raises for an
-    unavailable provider.
+    ``unavailable`` / ``failed`` detail when its preflight failed or its
+    build or search raised. Never raises for either.
     """
     if index_dir is None:
         index_dir = Path(tempfile.mkdtemp(prefix="knowledge-parity-"))
@@ -197,7 +222,12 @@ def parity_report(
     for query in queries:
         leann_top = outcomes["leann"]["top"][query]
         portable_top = outcomes["portable"]["top"][query]
-        available = [key for key in _PROVIDER_KEYS if outcomes[key]["unavailable"] is None]
+        available = [
+            key
+            for key in _PROVIDER_KEYS
+            if outcomes[key]["unavailable"] is None
+            and outcomes[key]["failed"] is None
+        ]
         score = (
             jaccard(leann_top, portable_top)
             if len(available) == len(_PROVIDER_KEYS)
@@ -209,8 +239,8 @@ def parity_report(
                 "leann_top": leann_top,
                 "portable_top": portable_top,
                 "jaccard": score,
-                "leann_ms": _mean(outcomes["leann"]["latencies_ms"]),
-                "portable_ms": _mean(outcomes["portable"]["latencies_ms"]),
+                "leann_ms": outcomes["leann"]["latency_ms"].get(query),
+                "portable_ms": outcomes["portable"]["latency_ms"].get(query),
             }
         )
 
@@ -220,9 +250,11 @@ def parity_report(
         outcome = outcomes[provider_key]
         if outcome["unavailable"] is not None:
             providers[provider_key] = {"unavailable": outcome["unavailable"]}
+        elif outcome["failed"] is not None:
+            providers[provider_key] = {"failed": outcome["failed"]}
         else:
             providers[provider_key] = {
-                "mean_ms": _mean(outcome["latencies_ms"]),
+                "mean_ms": _mean(list(outcome["latency_ms"].values())),
                 "build_seconds": round(outcome["build_seconds"], 3),
                 "store_bytes": outcome["store_bytes"],
             }
@@ -258,6 +290,8 @@ def _provider_column(summary: dict, provider_key: str) -> str:
     provider = summary["providers"][provider_key]
     if "unavailable" in provider:
         return f"{provider_key} unavailable: {provider['unavailable']}"
+    if "failed" in provider:
+        return f"{provider_key} failed: {provider['failed']}"
     return (
         f"{provider_key} mean_ms={_format_ms(provider['mean_ms'])} "
         f"build_s={provider['build_seconds']:.2f} "
@@ -307,9 +341,15 @@ def main(argv: list[str] | None = None) -> int:
         args.scope, args.repo, queries, index_dir=args.index_dir, top_k=args.top_k
     )
 
+    completed = sum(
+        1
+        for provider in report["summary"]["providers"].values()
+        if "unavailable" not in provider and "failed" not in provider
+    )
+
     if args.json:
         print(json.dumps(report, ensure_ascii=False))
-        return 0
+        return 0 if completed else 2
 
     header = ["query", "leann_top", "portable_top", "jaccard@k", "leann_ms", "portable_ms"]
     lines = [" | ".join(header)]
@@ -338,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
         f" | {_provider_column(summary, 'portable')}"
     )
     print("\n".join(lines))
-    return 0
+    return 0 if completed else 2
 
 
 if __name__ == "__main__":
