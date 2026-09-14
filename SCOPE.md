@@ -39,10 +39,9 @@ registry database (use in-memory or temp registry paths).
 ### 2.2 Windows-readiness proofs (`tests/test_portable_readiness.py`, new)
 
 Named exactly:
-- `test_package_imports_without_leann_torch_or_gpu`: in a subprocess whose
-  `sys.modules` pre-seeds `leann`, `leann_backend_hnsw`, `torch` and
-  `numpy`? — no: only `leann`, `leann_backend_hnsw` and `torch` are
-  blocked (an import hook that raises `ImportError` for them); importing
+- `test_package_imports_without_leann_torch_or_gpu`: in a subprocess with
+  an import hook that raises `ImportError` for `leann`,
+  `leann_backend_hnsw` and `torch` (nothing else is blocked); importing
   `knowledge_service`, `knowledge_service.app`, `knowledge_service.cli`,
   `knowledge_service.portable_provider`, `knowledge_service.learning` and
   `knowledge_service.maintenance` succeeds, and `create_app()` returns an
@@ -67,9 +66,9 @@ Named exactly:
 - `knowledge_service.cli download-model` already exists; document it
   under `## Windows` with the exact sequence a fresh Windows machine runs:
   `pip install -r requirements-portable.txt` (a new file listing only
-  `fastapi`, `uvicorn`, `pyyaml`, `onnxruntime`, `tokenizers`, `numpy`,
-  `zstandard`? — no, only what the portable path imports; derive it from
-  the imports, do not guess), `download-model`, `knowledge.ini` with
+  what the portable path actually imports — derive it from the imports of
+  the modules the service loads with `provider = portable`; do not
+  guess), `download-model`, `knowledge.ini` with
   `provider = portable`, `refresh`, `search`. State that `leann` and
   `torch` are not installed on that machine and that the package must not
   require them.
