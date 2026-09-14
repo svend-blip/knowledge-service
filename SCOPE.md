@@ -111,7 +111,7 @@ Testgoals green when the reviewer measures them; `git status` limited to
 ```testgoals
 id: TG1
 what: the six named tests exist and pass and the whole suite is green
-run: cd /home/svend/knowledge-service && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests -k "portable_index_search_roundtrip_with_fake_embedder or portable_update_replaces_and_remove_deletes or portable_scope_filter_and_token_budget or portable_preflight_reports_missing_model or resolve_provider_binds_portable_store_path or provider_contract_is_shared" 2>&1 | tail -n 1 | grep -E "^[6-9] passed|^[1-9][0-9] passed" && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
+run: cd /home/svend/knowledge-service && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests -k "portable_index_search_roundtrip_with_fake_embedder or portable_update_replaces_and_remove_deletes or portable_scope_filter_and_token_budget or portable_preflight_reports_missing_model or resolve_provider_binds_portable_store_path or provider_contract_is_shared or onnx_embedder_pools_a_realistic_session_output" 2>&1 | tail -n 1 | grep -E "^[7-9] passed|^[1-9][0-9] passed" && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
 expect: exit 0
 
 id: TG2
@@ -121,7 +121,7 @@ expect: exit 0
 
 id: TG3
 what: update and remove are real operations on the portable store
-run: cd /home/svend/knowledge-service && /home/svend/DPMtF-WebUI/venv/bin/python -c "import sys, json, tempfile, os; sys.path.insert(0, '.'); from knowledge_service.portable_provider import PortableProvider; d = tempfile.mkdtemp(); m = os.path.join(d, 'm.jsonl'); open(m, 'w').write(json.dumps({'scope': 's', 'path': 'a.md', 'content': 'apple pie'}) + '\n'); class E:\n    dim = 3\n    def embed(self, texts): return [[1.0, 0.0, 0.0] if 'apple' in t else [0.0, 1.0, 0.0] for t in texts]\np = PortableProvider(index_path=os.path.join(d, 's.portable.db'), embedder=E()); p.index(m); r = p.search('apple', scope='s', top_k=1); assert r and r[0]['path'] == 'a.md', r; open(m, 'w').write(json.dumps({'scope': 's', 'path': 'a.md', 'content': 'banana'}) + '\n'); p.update(m); r2 = p.search('apple', scope='s', top_k=1); assert r2 and r2[0]['content'] == 'banana', r2; p.remove(m); assert p.search('apple', scope='s', top_k=1) == []; print('ok')"
+run: cd /home/svend/knowledge-service && /home/svend/DPMtF-WebUI/venv/bin/python -c "import sys, json, tempfile, os; sys.path.insert(0, '.'); from knowledge_service.portable_provider import PortableProvider; d = tempfile.mkdtemp(); m = os.path.join(d, 'm.jsonl'); open(m, 'w').write(json.dumps({'scope': 's', 'path': 'a.md', 'content': 'apple pie'}) + chr(10)); E = type('E', (), {'dim': 3, 'embed': lambda self, texts: [[1.0, 0.0, 0.0] if 'apple' in t else [0.0, 1.0, 0.0] for t in texts]}); p = PortableProvider(index_path=os.path.join(d, 's.portable.db'), embedder=E()); p.index(m); r = p.search('apple', scope='s', top_k=1); assert r and r[0]['path'] == 'a.md', r; open(m, 'w').write(json.dumps({'scope': 's', 'path': 'a.md', 'content': 'banana'}) + chr(10)); p.update(m); r2 = p.search('apple', scope='s', top_k=1); assert r2 and r2[0]['content'] == 'banana', r2; p.remove(m); assert p.search('apple', scope='s', top_k=1) == []; print('ok')"
 expect: exit 0
 
 id: TG4
@@ -139,6 +139,31 @@ what: LIVE (reviewer only) — the real model is downloaded, the flowrunner mani
 run: cd /home/svend/knowledge-service && d="$(mktemp -d)" && venv/bin/python -m knowledge_service.cli download-model --model-dir "$d/model" >/dev/null && venv/bin/python -c "import sys, time; sys.path.insert(0, '.'); from knowledge_service.portable_provider import PortableProvider; p = PortableProvider(index_path=sys.argv[1] + '/flowrunner.portable.db', model_dir=sys.argv[1] + '/model'); t = time.perf_counter(); p.index('/home/svend/.local/share/dpmtf/knowledge_index/flowrunner.jsonl'); b = time.perf_counter() - t; t = time.perf_counter(); r = p.search('How is a FlowApp exported and imported?', scope='flowrunner', top_k=3); s = time.perf_counter() - t; print(f'build {b:.1f}s search {s:.2f}s', [x['path'] for x in r]); raise SystemExit(0 if r and any('export' in x['path'].lower() or 'import' in x['path'].lower() for x in r) else 1)" "$d"
 expect: exit 0
 ```
+
+## 4b. Correction 1 (reviewer, 2026-09-14 12:40Z) — the real embedder returns a 3-D result
+
+Measured with the downloaded model (`OnnxEmbedder(model_dir).embed(["apple pie", "How is a FlowApp exported?"])`):
+each returned "vector" is a list of lists, and `index()` then dies in
+`_encode_vector` with `struct.error: required argument is not a float`. Cause
+in `OnnxEmbedder._embed_batch`: `counts = mask.sum(axis=1)` already has shape
+`(batch, 1)`; dividing `sums` (shape `(batch, hidden)`) by `counts[:, None]`
+(shape `(batch, 1, 1)`) broadcasts to `(batch, batch, hidden)`. Fix: divide by
+`counts` as it is. The fake-embedder tests could not see this because they
+bypass pooling entirely. Required in this correction:
+
+1. The one-line fix in `_embed_batch`, and an assertion right after pooling
+   that `pooled.ndim == 2` and `pooled.shape[0] == len(texts)`.
+2. A hermetic test, named exactly `test_onnx_embedder_pools_a_realistic_session_output`,
+   that builds `OnnxEmbedder` with an injected fake session and tokenizer
+   (`session.run` returns one array of shape `(batch, seq, hidden)`;
+   `get_inputs()` names `input_ids` and `attention_mask`) and asserts the
+   embedder returns `len(texts)` vectors of `hidden` floats, L2-normalised,
+   and that padding positions do not change the pooled value. The
+   constructor must therefore accept an optional session/tokenizer pair for
+   tests without loading files.
+3. TG1's named list gains that test (seven names). Nothing else changes.
+
+Report as before with git status and TG1–TG5; the reviewer re-runs TG6.
 
 ## 5. Initial Execution Instruction
 
