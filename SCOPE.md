@@ -91,8 +91,8 @@ read or write under any real `.flowrunner/` — tests use temp roots.
 
 ```testgoals
 id: TG1
-what: the six named tests exist and pass and the whole suite is green
-run: cd /home/svend/knowledge-service && for t in artifact_key_carries_the_repository_slug legacy_layout_is_migrated_once_with_a_ledger_line supersedes_accepts_two_and_three_part_references drafts_are_found_under_every_registered_repository admit_run_refuses_a_draft_whose_repository_does_not_match learning_routes_and_cli_take_three_part_refs; do grep -q "def test_$t" tests/*.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
+what: the eight named tests exist and pass and the whole suite is green
+run: cd /home/svend/knowledge-service && for t in artifact_key_carries_the_repository_slug legacy_layout_is_migrated_once_with_a_ledger_line supersedes_accepts_two_and_three_part_references drafts_are_found_under_every_registered_repository admit_run_refuses_a_draft_whose_repository_does_not_match learning_routes_and_cli_take_three_part_refs refresh_records_the_repository_path_and_refresh_all_uses_it set_repository_cli_and_scopes_route_show_the_path; do grep -q "def test_$t" tests/*.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
 expect: exit 0
 
 id: TG2
@@ -110,6 +110,52 @@ what: LIVE (reviewer only) — on 9140 the admitted artifact answers under dpmtf
 run: test -f /tmp/claude-1000/-home-svend-DPMtF-WebUI/e20394ae-27d0-4204-804f-5d6a2f5da054/scratchpad/a2-4-live/ok
 expect: exit 0
 ```
+
+## 4b. Correction 1 (reviewer, 2026-09-15 00:50Z) — the registry's `location` is the manifest path, not the repository
+
+Measured live against a copy of the learning directory: the migration,
+the three-part listing and the search all behave; `/v1/learning/drafts`
+answered `[]` although DPMtF's run 040 still holds its (admitted) draft.
+Cause: `knowledge_indexes.location` for a repository scope is the manifest
+path (`<index_dir>/<scope>.jsonl`), so `<location>/.flowrunner` never
+exists — the premise in §2.2 was the reviewer's error. The same reading
+already breaks the daily refresh: the timer's `refresh-all --from-registry`
+logged `skip <scope>: recorded repository path '<index_dir>/<scope>.jsonl'
+does not exist` for every repository scope on 2026-09-15 00:00. The
+service needs the repository path as its own fact. Required:
+
+1. `knowledge_indexes` gains `repository_path TEXT NOT NULL DEFAULT ''`
+   (`db.py`: `ALTER TABLE … ADD COLUMN` on first connect when absent, the
+   same pattern as the portable store's `metadata`). `refresh <scope>
+   <repo_path>` (CLI and `POST /v1/refresh`) records the resolved
+   repository path on the row; `import-registry` leaves it empty; a new
+   CLI `set-repository <scope> <path>` sets it for an existing row
+   (refuses a path that is not a directory). `GET /v1/scopes` rows carry
+   `repository_path`.
+2. `refresh-all --from-registry` refreshes the scopes whose
+   `repository_path` is a directory, and — for compatibility — a scope
+   whose `repository_path` is empty but whose `location` is a directory;
+   every other repository scope is skipped with a message naming the
+   missing `repository_path` and the `set-repository` command.
+3. Learning runs roots: a repository's runs root is
+   `<repository_path>/.flowrunner`; the father fallback to
+   `[learning] runs_root` stays. `list_pending_drafts` scans every scope
+   with a `repository_path`. `draft_path`/`admit_run`/`validate_run`
+   resolve the repository the same way and report `unknown repository`
+   (naming `set-repository`) when the slug has no path.
+4. Tests, named exactly:
+   `test_refresh_records_the_repository_path_and_refresh_all_uses_it`
+   (temp registry: one scope refreshed through `refresh_scope` carries the
+   path; a second imported scope with a manifest `location` and empty
+   `repository_path` is skipped by `refresh-all --dry-run` with the
+   message; after `set-repository` it is listed),
+   `test_set_repository_cli_and_scopes_route_show_the_path`; and the
+   existing `test_drafts_are_found_under_every_registered_repository`
+   sets `repository_path` in its fixture instead of relying on `location`.
+   TG1's named list gains the two tests (eight names). README: the column,
+   the command, the runs-root rule.
+
+Report as before with `git status` and TG1–TG3; the reviewer re-runs TG4.
 
 ## 5. Initial Execution Instruction
 
