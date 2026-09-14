@@ -4,6 +4,7 @@ Description=Standalone knowledge service (/v1 on 127.0.0.1:9140)
 [Service]
 Type=simple
 Environment=KNOWLEDGE_SERVICE_INI=%h/.config/knowledge-service/knowledge.ini
+WorkingDirectory=%h/knowledge-service
 ExecStart=%h/knowledge-service/venv/bin/python -m knowledge_service.cli serve
 Nice=10
 # The service stops by itself when the GPU is busy (preflight refuses);
