@@ -439,9 +439,11 @@ def _cmd_learning(args: argparse.Namespace) -> int:
         if command == "validate-run":
             return knowledge_learning.validate_run(args.ref)
         if command == "admit":
-            return knowledge_learning.admit(args.yaml_path)
+            return knowledge_learning.admit(args.yaml_path, strict=args.strict)
         if command == "admit-run":
-            return knowledge_learning.admit_run(args.ref, args.admitted_by)
+            return knowledge_learning.admit_run(
+                args.ref, args.admitted_by, strict=args.strict
+            )
         if command == "drafts":
             return knowledge_learning.print_drafts()
         if command == "retract":
@@ -517,6 +519,10 @@ def build_parser() -> argparse.ArgumentParser:
         "admit", help="admit one validated artifact into experience"
     )
     learning_admit.add_argument("yaml_path")
+    learning_admit.add_argument(
+        "--strict", action="store_true",
+        help="refuse what normalisation would fix instead of fixing it",
+    )
     learning_admit.set_defaults(handler=_cmd_learning)
     learning_admit_run = learning_sub.add_parser(
         "admit-run", help="admit one closed run's LEARNING-DRAFT in place"
@@ -527,6 +533,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     learning_admit_run.add_argument(
         "--admitted-by", default="", help="name of the admitting supervisor"
+    )
+    learning_admit_run.add_argument(
+        "--strict", action="store_true",
+        help="refuse what normalisation would fix instead of fixing it",
     )
     learning_admit_run.set_defaults(handler=_cmd_learning)
     learning_validate_run = learning_sub.add_parser(

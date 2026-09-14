@@ -351,7 +351,20 @@ slug is not the father's is reported `unknown repository` naming
 directory present the check is skipped with a warning, so a foreign machine
 can still admit by hand. The status line may carry Markdown
 bold — `**Status:** SUCCESS` and `**Status: SUCCESS** — run closed.` both
-prove closure, decoration before the word is ignored. Superseding and retracting move
+prove closure, decoration before the word is ignored. Before validating, admission
+normalises the mechanical slips itself: a scalar
+`architecture_implications`, `failed_approaches` or `important_files`
+becomes a one-item list (an empty string an empty list), a
+`validation.testgoals` list of ids becomes `"<n>/<n> green"`, and integer
+`family`/`run` become strings padded to match a zero-padded run directory
+name — the draft file keeps its bytes, the admitted artifact is the
+normalised document, and `GET /v1/learning/drafts` reports the sentences as
+`normalisations` beside the post-normalisation `valid` and `violations`.
+Every change writes its own `| normalised | <repository>/<family>/<run> |
+<sentence>` ledger line before the `admitted` line, and `learning
+validate-run` previews them under `would normalise:`. `--strict` on
+`admit-run` and `admit` disables the fixes, so the document must validate
+exactly as written. Superseding and retracting move
 the older artifact to `<learning_dir>/history/...` with `superseded_by` /
 `retracted_at` written into it; it stays retrievable through
 `include_history=true`. Every admission, supersede and retraction is one

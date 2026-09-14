@@ -523,6 +523,8 @@ def create_app():
         ``learning admit-run``.
         """
         drafts = learning.list_pending_drafts()
+        # Rows carry ``normalisations``: the sentences admission's normalise
+        # applies; ``valid`` and ``violations`` describe the normalised draft.
         if pending:
             drafts = [item for item in drafts if not item["admitted"]]
         return {"drafts": drafts}

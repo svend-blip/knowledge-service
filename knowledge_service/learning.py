@@ -210,6 +210,72 @@ def _split_ref(ref) -> tuple[str | None, str, str] | None:
     return None, family, run
 
 
+def normalise(doc: dict, run_dir: str | None = None) -> tuple[dict, list[str]]:
+    """Return ``(copy, sentences)``: the mechanical fixes and one line each.
+
+    Three mechanical slips the decomposers make are fixed on a copy (the
+    draft file is never touched): a scalar ``architecture_implications``,
+    ``failed_approaches`` or ``important_files`` becomes a one-item list
+    (an empty string becomes an empty list); a ``validation.testgoals`` list
+    of ids becomes ``"<n>/<n> green"``; integer ``family`` and ``run`` become
+    strings — zero-padded to the width of ``run_dir`` when that run-directory
+    name is zero-padded, plain strings otherwise. Everything else is carried
+    over unchanged. ``validate`` runs on the returned document. Never raises.
+    """
+    sentences: list[str] = []
+    if not isinstance(doc, dict):
+        return {}, sentences
+    out = dict(doc)
+
+    for key in ("architecture_implications", "failed_approaches",
+                "important_files"):
+        if key not in out or isinstance(out[key], list):
+            continue
+        value = out[key]
+        if value == "" or value is None:
+            out[key] = []
+            sentences.append(f"{key}: empty value became an empty list")
+        else:
+            out[key] = [value]
+            sentences.append(
+                f"{key}: scalar value wrapped into a one-item list"
+            )
+
+    validation = out.get("validation")
+    if isinstance(validation, dict) and isinstance(
+        validation.get("testgoals"), list
+    ):
+        count = len(validation["testgoals"])
+        rewritten = f"{count}/{count} green"
+        out["validation"] = {**validation, "testgoals": rewritten}
+        sentences.append(
+            f"validation.testgoals: list of {count} ids became"
+            f" \"{rewritten}\""
+        )
+
+    padded = (
+        isinstance(run_dir, str)
+        and len(run_dir) > 1
+        and run_dir.startswith("0")
+    )
+    for key in ("family", "run"):
+        value = out.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        fixed = str(value).zfill(len(run_dir)) if padded else str(value)
+        out[key] = fixed
+        if padded:
+            sentences.append(
+                f"{key}: integer became the padded string \"{fixed}\""
+                " matching the run directory name"
+            )
+        else:
+            sentences.append(
+                f"{key}: integer became the plain string \"{fixed}\""
+            )
+    return out, sentences
+
+
 # ── paths ───────────────────────────────────────────────────────────────
 
 
@@ -461,6 +527,22 @@ def _ledger_line(
         )
 
 
+def _append_normalised_line(
+    repository: str | None, family: str, run: str, sentence: str
+) -> None:
+    """Append one ``normalised`` ledger line for one mechanical fix."""
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    ledger = learning_dir() / "LEDGER.md"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    header_needed = not ledger.is_file()
+    key = f"{_repository_slug(repository)}/{family}/{run}"
+    action = "normalised"
+    with ledger.open("a", encoding="utf-8") as handle:
+        if header_needed:
+            handle.write("# Learning Ledger\n\n")
+        handle.write(f"- {stamp} | {action} | {key} | {sentence}\n")
+
+
 def validate_file(path: str) -> int:
     """Validate one artifact YAML; print violations, return the exit code."""
     artifact = Path(path).expanduser()
@@ -475,11 +557,14 @@ def validate_file(path: str) -> int:
     return 0 if not violations else 1
 
 
-def admit(path: str) -> int:
+def admit(path: str, strict: bool = False) -> int:
     """Admit one learning artifact; return the process exit code.
 
     Refusals (exit 1, clean message): a failing schema validation, a
-    ``hypothesis`` evidence level, or a run that is not closed SUCCESS. On
+    ``hypothesis`` evidence level, or a run that is not closed SUCCESS. The
+    mechanical normalisation runs on the loaded document first unless
+    ``strict`` is set; ``strict`` requires it to validate exactly as written.
+    On
     success the artifact is written under the learning directory, every name
     in ``supersedes`` moves to history with ``superseded_by``, one ledger line
     is appended, and both live manifests plus their scopes are rebuilt (the
@@ -492,19 +577,26 @@ def admit(path: str) -> int:
     doc, message = _load_yaml(source)
     if doc is None:
         return _fail(message)
-    return admit_document(doc, str(source))
+    return admit_document(doc, str(source), strict=strict)
 
 
-def admit_document(doc: dict, source: str) -> int:
+def admit_document(doc: dict, source: str, strict: bool = False) -> int:
     """Run the whole admission on one loaded document; ``source`` is the origin.
 
     The document-level half of admission, shared by ``admit`` (which loads a
     given file) and ``admit_run`` (which loads a run's draft in place):
-    validate, migrate legacy-layout artifacts, prove the run closed SUCCESS,
-    apply ``supersedes``, write the artifact under its repository slug, append
-    one ledger line carrying ``source``, rebuild. The source document itself
-    is never modified or moved.
+    normalise the mechanical slips unless ``strict``, validate, migrate
+    legacy-layout artifacts, prove the run closed SUCCESS, apply
+    ``supersedes``, write the artifact under its repository slug, append one
+    ``normalised`` ledger line per change before the ``admitted`` line
+    carrying ``source``, rebuild. The source document itself is never
+    modified or moved.
     """
+    sentences: list[str] = []
+    if not strict:
+        doc, sentences = normalise(
+            doc, run_dir=Path(source).expanduser().parent.name
+        )
     violations = validate(doc)
     if violations:
         for violation in violations:
@@ -535,18 +627,21 @@ def admit_document(doc: dict, source: str) -> int:
         )
 
     _dump_yaml(_artifact_path(repository, family, run), dict(doc))
+    for sentence in sentences:
+        _append_normalised_line(repository, family, run, sentence)
     _ledger_line("admitted", repository, family, run, doc, source)
     return rebuild()
 
 
-def admit_run(ref: str, admitted_by: str) -> int:
+def admit_run(ref: str, admitted_by: str, strict: bool = False) -> int:
     """Admit the draft of one closed run in place; return the exit code.
 
     ``ref`` is ``"<repository>/<family>/<run>"``; the legacy two-part
     ``"<family>/<run>"`` means the father repository. The draft is read from
     the run directory (``draft_path``), its ``admitted_by`` is replaced with
     the admitter's name, and exactly the document-level admission path runs
-    on it. Refusals (exit 1, clean message): a malformed ref, an unknown
+    on it (``normalise`` first unless ``strict``). Refusals (exit 1, clean
+    message): a malformed ref, an unknown
     repository, a missing draft, a draft whose ``repository`` field does not
     match the repository it was found under, an empty ``admitted_by``, the
     value ``pending`` in any casing, plus everything ``admit_document``
@@ -592,13 +687,15 @@ def admit_run(ref: str, admitted_by: str) -> int:
         )
     doc = dict(doc)
     doc["admitted_by"] = name
-    return admit_document(doc, str(artifact))
+    return admit_document(doc, str(artifact), strict=strict)
 
 
 def validate_run(ref: str) -> int:
-    """Print one run's draft violations and its run status; never admits.
+    """Print what admission would normalise, then violations and run status.
 
-    Violations print exactly as ``validate_file`` prints them, then one line
+    Sentences for the mechanical fixes print under ``would normalise:``
+    first; violations of the normalised document then print exactly as
+    ``validate_file`` prints them, then one line
     ``run status: <SUCCESS|BLOCKED|…|missing>`` from the END-REPORT's first
     ``Status`` line (Markdown stripped, ``missing`` when there is none). Exit
     code follows the violations.
@@ -626,6 +723,11 @@ def validate_run(ref: str) -> int:
     if doc is None:
         return _fail(message)
 
+    doc, sentences = normalise(doc, run_dir=run)
+    if sentences:
+        print("would normalise:")
+        for sentence in sentences:
+            print(f"- {sentence}")
     violations = validate(doc)
     for violation in violations:
         print(violation)
@@ -740,8 +842,10 @@ def list_pending_drafts() -> list[dict]:
     under), ``family``, ``run``, ``topic``, ``evidence_level``,
     ``run_status`` (the word from the run's END-REPORT, ``missing`` when there
     is none), ``admitted`` (an artifact for that ``repository/family/run``
-    exists under the learning directory or its history), ``valid`` and
-    ``violations`` (the number of schema violations). Sorted by ``family``,
+    exists under the learning directory or its history), ``valid``,
+    ``violations`` (the schema violations left after the mechanical
+    normalisation) and ``normalisations`` (one sentence per fix ``normalise``
+    applies). Sorted by ``family``,
     then ``run``, then ``repository``. A draft that does not parse is listed
     with ``valid`` false, one violation and an empty topic. Missing runs roots
     contribute nothing. Pure read: nothing is written or rebuilt.
@@ -779,9 +883,13 @@ def list_pending_drafts() -> list[dict]:
             doc, message = _load_yaml(artifact)
             if doc is None:
                 _warn(message)
-                record.update({"topic": "", "valid": False, "violations": 1})
+                record.update(
+                    {"topic": "", "valid": False, "violations": 1,
+                     "normalisations": []}
+                )
                 drafts.append(record)
                 continue
+            doc, sentences = normalise(doc, run_dir=run)
             violations = validate(doc)
             validation = doc.get("validation") or {}
             level = (
@@ -795,6 +903,7 @@ def list_pending_drafts() -> list[dict]:
                     "evidence_level": str(level),
                     "valid": not violations,
                     "violations": len(violations),
+                    "normalisations": sentences,
                 }
             )
             drafts.append(record)

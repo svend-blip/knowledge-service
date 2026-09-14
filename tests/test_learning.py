@@ -1408,3 +1408,169 @@ def test_set_repository_cli_and_scopes_route_show_the_path(
     assert response.status_code == 200
     rows = {row["scope"]: row for row in response.json()}
     assert Path(rows["delta"]["repository_path"]).resolve() == repo.resolve()
+
+
+# ── A2-5: admission normalises the mechanical slips ──────────────────────
+
+
+def test_normalise_wraps_scalars_and_rewrites_testgoals_and_reports_each_change():
+    doc = {
+        "topic": "t",
+        "architecture_implications": "One LEANN store per scope.",
+        "failed_approaches": "",
+        "important_files": ["knowledge_service/cli.py"],
+        "family": 2000,
+        "run": 41,
+        "validation": {
+            "evidence_level": "tests",
+            "verdicts": ["041 APPROVED"],
+            "testgoals": ["TG1", "TG2", "TG3"],
+        },
+        "supersedes": [],
+    }
+
+    fixed, sentences = learning.normalise(doc, run_dir="041")
+
+    assert fixed["architecture_implications"] == ["One LEANN store per scope."]
+    assert fixed["failed_approaches"] == []
+    assert fixed["important_files"] == ["knowledge_service/cli.py"]
+    assert fixed["validation"]["testgoals"] == "3/3 green"
+    assert fixed["family"] == "2000"
+    assert fixed["run"] == "041"
+
+    # The copy fixes; the draft document keeps exactly what it held.
+    assert doc["architecture_implications"] == "One LEANN store per scope."
+    assert doc["validation"]["testgoals"] == ["TG1", "TG2", "TG3"]
+
+    assert len(sentences) == 5
+    joined = " ".join(sentences)
+    assert "architecture_implications" in joined
+    assert "validation.testgoals" in joined and "3/3 green" in joined
+    assert "\"041\"" in joined
+
+    plain, plain_sentences = learning.normalise(doc)
+    assert plain["family"] == "2000"
+    assert plain["run"] == "41"
+    assert len(plain_sentences) == 5
+
+    clean, clean_sentences = learning.normalise(make_doc())
+    assert clean == make_doc()
+    assert clean_sentences == []
+
+
+def test_admit_run_normalises_and_ledgers_before_admitting(tmp_path, monkeypatch):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "2000", "041")
+    slipped = make_doc(
+        run="041",
+        admitted_by="pending",
+        architecture_implications="One LEANN store per scope.",
+    )
+    slipped["validation"] = {
+        "evidence_level": "tests",
+        "verdicts": ["041 APPROVED"],
+        "testgoals": ["TG1", "TG2"],
+    }
+    draft = write_run_draft(tmp_path, "2000", "041", slipped)
+    before = draft.read_bytes()
+
+    assert learning.admit_run("2000/041", "svend") == 0
+
+    artifact = yaml.safe_load(
+        (learning.learning_dir() / "dpmtf-webui" / "2000" / "041.yaml")
+        .read_text(encoding="utf-8")
+    )
+    assert artifact["architecture_implications"] == ["One LEANN store per scope."]
+    assert artifact["validation"]["testgoals"] == "2/2 green"
+    assert artifact["admitted_by"] == "svend"
+
+    assert draft.read_bytes() == before
+
+    lines = ledger_lines()
+    assert len(lines) == 3
+    assert (
+        "| normalised | dpmtf-webui/2000/041 | architecture_implications:"
+        in lines[0]
+    )
+    assert (
+        "| normalised | dpmtf-webui/2000/041 | validation.testgoals:"
+        in lines[1]
+    )
+    assert "| admitted | dpmtf-webui/2000/041 | tests | svend |" in lines[2]
+
+
+def test_strict_admission_refuses_what_normalisation_would_fix(
+    tmp_path, monkeypatch, capsys
+):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "2000", "041")
+    slipped = make_doc(
+        run="041", architecture_implications="One store per scope."
+    )
+    slipped["validation"] = {
+        "evidence_level": "tests",
+        "verdicts": [],
+        "testgoals": ["TG1"],
+    }
+    write_run_draft(tmp_path, "2000", "041", slipped)
+
+    assert learning.admit_run("2000/041", "svend", strict=True) == 1
+    captured = capsys.readouterr()
+    assert "architecture_implications must be a list" in captured.out
+    assert "schema violation" in captured.err
+    assert not learning.learning_dir().joinpath(
+        "dpmtf-webui", "2000", "041.yaml"
+    ).is_file()
+
+    assert cli.main(
+        ["learning", "admit-run", "2000/041", "--strict", "--admitted-by", "svend"]
+    ) == 1
+
+    # Without --strict the same draft is admitted with the fixes applied.
+    assert cli.main(
+        ["learning", "admit-run", "2000/041", "--admitted-by", "svend"]
+    ) == 0
+    assert learning.learning_dir().joinpath(
+        "dpmtf-webui", "2000", "041.yaml"
+    ).is_file()
+
+
+def test_drafts_route_reports_normalisations_and_post_normalisation_validity(
+    tmp_path, monkeypatch
+):
+    setup_service(tmp_path, monkeypatch)
+    close_run(tmp_path, "1000", "007")
+    close_run(tmp_path, "3000", "002")
+    write_run_draft(tmp_path, "1000", "007", make_doc(family="1000", run="007"))
+    slipped = make_doc(
+        family="3000", run="002", architecture_implications="Second store."
+    )
+    slipped["validation"] = {
+        "evidence_level": "tests",
+        "verdicts": ["002 APPROVED"],
+        "testgoals": ["TG1", "TG2", "TG3"],
+    }
+    write_run_draft(tmp_path, "3000", "002", slipped)
+
+    client = TestClient(create_app())
+    response = client.get("/v1/learning/drafts")
+    assert response.status_code == 200
+    rows = {
+        (row["family"], row["run"]): row for row in response.json()["drafts"]
+    }
+
+    clean = rows[("1000", "007")]
+    assert clean["normalisations"] == []
+    assert clean["valid"] is True
+
+    fixed = rows[("3000", "002")]
+    assert fixed["valid"] is True
+    assert fixed["violations"] == 0
+    assert len(fixed["normalisations"]) == 2
+    assert any(
+        "architecture_implications" in sentence
+        for sentence in fixed["normalisations"]
+    )
+    assert any(
+        "testgoals" in sentence for sentence in fixed["normalisations"]
+    )
