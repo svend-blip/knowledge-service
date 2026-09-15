@@ -7,6 +7,10 @@ row behind. The read side lives here too: ``query_retrievals`` pages the log
 newest-first and ``summarise_retrievals`` totals it, both against the
 configured database opened read-only and both answering with the empty state
 instead of raising when the database or table is missing.
+``prune_retrievals`` is the one deliberate deletion path: dry by default, and
+every real deletion appends one line to ``RETRIEVAL-LEDGER.md`` beside the
+learning ledger. Deletion is an operator act at the host, so there is
+deliberately no HTTP route for it.
 
 Provider-neutral by construction: the module imports only this package's
 config and database helpers, the standard library, and FastAPI's
@@ -18,10 +22,19 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from knowledge_service import config, db
 
-__all__ = ["record_retrieval", "query_retrievals", "summarise_retrievals"]
+__all__ = [
+    "record_retrieval",
+    "query_retrievals",
+    "summarise_retrievals",
+    "prune_retrievals",
+    "retrieval_ledger_path",
+    "RETRIEVAL_LEDGER_NAME",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -281,3 +294,220 @@ def summarise_retrievals(
         "first": totals[4],
         "last": totals[5],
     }
+
+
+# ── pruning the log ──────────────────────────────────────────────────────
+
+#: The service's own audit trail for prunings, sibling of the learning
+#: ledger's ``LEDGER.md`` under the configured learning directory.
+RETRIEVAL_LEDGER_NAME = "RETRIEVAL-LEDGER.md"
+
+
+def retrieval_ledger_path() -> Path:
+    """Return the path of the retrieval ledger under the learning dir."""
+    return Path(config.get_learning_dir()) / RETRIEVAL_LEDGER_NAME
+
+
+def _normalise_stamp(value) -> str:
+    """``YYYY-MM-DD HH:MM:SS`` and ``YYYY-MM-DDTHH:MM:SS`` compare alike."""
+    return str(value).replace(" ", "T")[:19]
+
+
+def _older_than_threshold(value) -> str:
+    """Resolve ``older_than`` to an ISO stamp.
+
+    A plain day count (``"30"``) means that many days before now, UTC;
+    anything else must parse as ISO-8601. A value that is neither is a
+    ``ValueError`` naming it — the same refusal shape the routes use.
+    """
+    text = str(value).strip()
+    if text.isdigit():
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(text))
+        return cutoff.isoformat(timespec="seconds")[:19]
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(
+            f"older_than must be ISO-8601 or a plain day count, got {value!r}"
+        ) from None
+    return parsed.isoformat()[:19]
+
+
+def _prune_empty(dry_run: bool) -> dict:
+    """The empty prune state: nothing selected, nothing deleted."""
+    return {
+        "selected": 0,
+        "deleted": 0,
+        "dry_run": bool(dry_run),
+        "oldest": None,
+        "newest": None,
+        "by_scope": {},
+        "by_agent_role": {},
+        "remaining": 0,
+    }
+
+
+def prune_retrievals(
+    *,
+    older_than: str | None = None,
+    keep_last: int | str | None = None,
+    run_id: str | None = None,
+    flow_key: str | None = None,
+    agent_role: str | None = None,
+    scope: str | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """Select and (only when asked) delete old retrieval-log rows.
+
+    Two selection rules combine by intersection: ``older_than`` is an ISO-8601
+    timestamp or a plain day count (days before now, UTC) and selects rows
+    with ``created_at`` strictly older; ``keep_last`` is a row count and
+    selects every candidate except the newest N. A row must satisfy **both**
+    to be selected, so ``older_than="30", keep_last=1000`` keeps anything
+    younger than 30 days *and* the newest thousand. ``run_id``, ``flow_key``,
+    ``agent_role`` and ``scope`` narrow the candidate set exactly as
+    ``query_retrievals`` narrows its rows. At least one selection rule is
+    required: without one the call raises ``ValueError``, never a full wipe.
+
+    ``dry_run`` defaults to true: the caller gets the honest report and an
+    untouched table. With ``dry_run=False`` the selection is deleted in one
+    transaction and one ledger line is appended to
+    ``<learning_dir>/RETRIEVAL-LEDGER.md`` recording what went. Parameterized
+    SQL only; a missing database or table is the empty state, never an
+    exception, and reading never creates the file.
+    """
+    if older_than is None and keep_last is None:
+        raise ValueError(
+            "prune needs a selection rule: pass older_than and/or keep_last"
+        )
+    keep: int | None = None
+    if keep_last is not None:
+        try:
+            keep = max(int(keep_last), 0)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"keep_last must be an integer row count, got {keep_last!r}"
+            ) from None
+    older = None if older_than is None else _older_than_threshold(older_than)
+
+    filters = " ".join(
+        f"{name}={value}"
+        for name, value in (
+            ("older_than", older_than),
+            ("keep_last", keep_last),
+            ("run_id", run_id),
+            ("flow_key", flow_key),
+            ("agent_role", agent_role),
+            ("scope", scope),
+        )
+        if value is not None
+    )
+
+    where, params = _conditions(
+        run_id=run_id, handoff_id=None, flow_key=flow_key,
+        agent_role=agent_role, scope=scope, since=None, until=None,
+    )
+    conn = _open_log_database()
+    if conn is None:
+        return _prune_empty(dry_run)
+    try:
+        candidates = conn.execute(
+            f"SELECT id, created_at, scope, agent_role"
+            f" FROM knowledge_retrieval_log{where}"
+            " ORDER BY replace(created_at, ' ', 'T') DESC, id DESC",
+            params,
+        ).fetchall()
+        total_all = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_retrieval_log"
+        ).fetchone()[0]
+    except sqlite3.Error:
+        return _prune_empty(dry_run)
+    finally:
+        conn.close()
+
+    # ``keep_last`` ranks within the filtered candidates; a row is selected
+    # only when it also fails the age rule — the two rules intersect.
+    ranked_ids = [row["id"] for row in candidates]
+    beyond_keep = set(
+        ranked_ids[keep:] if keep is not None else ranked_ids
+    )
+    selected = [
+        row
+        for row in candidates
+        if row["id"] in beyond_keep
+        and (older is None or _normalise_stamp(row["created_at"]) < older)
+    ]
+
+    by_scope: dict[str, int] = {}
+    by_role: dict[str, int] = {}
+    for row in selected:
+        scope_key = str(row["scope"] or "")
+        role_key = str(row["agent_role"] or "")
+        by_scope[scope_key] = by_scope.get(scope_key, 0) + 1
+        by_role[role_key] = by_role.get(role_key, 0) + 1
+
+    oldest = selected[-1]["created_at"] if selected else None
+    newest = selected[0]["created_at"] if selected else None
+    deleted = len(selected)
+    remaining = int(total_all) - deleted
+
+    if dry_run:
+        return {
+            "selected": deleted,
+            "deleted": 0,
+            "dry_run": True,
+            "oldest": oldest,
+            "newest": newest,
+            "by_scope": by_scope,
+            "by_agent_role": by_role,
+            "remaining": remaining,
+        }
+
+    ids = [row["id"] for row in selected]
+    try:
+        conn = db.connect()
+        try:
+            if ids:
+                placeholders = ", ".join("?" for _ in ids)
+                conn.execute(
+                    f"DELETE FROM knowledge_retrieval_log"
+                    f" WHERE id IN ({placeholders})",
+                    tuple(ids),
+                )
+            conn.commit()
+            remaining = int(conn.execute(
+                "SELECT COUNT(*) FROM knowledge_retrieval_log"
+            ).fetchone()[0])
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.error("knowledge retrieval log prune failed: %s", exc)
+        return _prune_empty(dry_run)
+
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _append_retrieval_ledger_line(
+        f"- {stamp} | pruned | {deleted} rows | "
+        f"{oldest or ''}..{newest or ''} | {filters}"
+    )
+    return {
+        "selected": deleted,
+        "deleted": deleted,
+        "dry_run": False,
+        "oldest": oldest,
+        "newest": newest,
+        "by_scope": by_scope,
+        "by_agent_role": by_role,
+        "remaining": remaining,
+    }
+
+
+def _append_retrieval_ledger_line(line: str) -> None:
+    """Append one prune line to ``RETRIEVAL-LEDGER.md``, created on first use."""
+    ledger = retrieval_ledger_path()
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    header_needed = not ledger.is_file()
+    with ledger.open("a", encoding="utf-8") as handle:
+        if header_needed:
+            handle.write("# Retrieval log ledger\n\n")
+        handle.write(line + "\n")
+    return None

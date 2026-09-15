@@ -7,7 +7,9 @@ live service or the operator's own log.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 
 from knowledge_service import cli, config, db, retrieval_log
@@ -264,3 +266,155 @@ def test_cli_retrievals_prints_lines_and_summary(tmp_path, monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["total"] == 4 and len(payload["rows"]) == 4
     assert payload["rows"][0]["query"].startswith("q-four")
+
+
+# ── prune_retrievals ─────────────────────────────────────────────────────
+
+
+def test_prune_requires_a_selection_rule(tmp_path, monkeypatch, capsys):
+    seed(tmp_path, monkeypatch, standard_rows())
+
+    with pytest.raises(ValueError):
+        retrieval_log.prune_retrievals()
+
+    # the CLI refuses with exit code 2 and deletes nothing
+    assert cli.main(["retrievals", "prune"]) == 2
+    err = capsys.readouterr().err
+    assert "--older-than" in err and "--keep-last" in err
+    assert retrieval_log.query_retrievals()["total"] == 4
+
+
+def test_prune_dry_run_reports_without_deleting(tmp_path, monkeypatch):
+    seed(tmp_path, monkeypatch, standard_rows())
+
+    answer = retrieval_log.prune_retrievals(keep_last="2")
+    assert answer == {
+        "selected": 2,
+        "deleted": 0,
+        "dry_run": True,
+        "oldest": "2026-09-15 08:00:00",
+        "newest": "2026-09-15 09:00:00",
+        "by_scope": {"dpmtf": 1, "other": 1},
+        "by_agent_role": {"dsh": 1, "supervisor": 1},
+        "remaining": 2,
+    }
+    # a dry run touches neither the table nor the ledger
+    assert retrieval_log.query_retrievals()["total"] == 4
+    assert not retrieval_log.retrieval_ledger_path().exists()
+
+
+def test_prune_older_than_and_keep_last_intersect(tmp_path, monkeypatch):
+    seed(tmp_path, monkeypatch, standard_rows())
+    cutoff = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(
+        timespec="seconds"
+    )[:19]
+
+    # everything is older than the cutoff, so keep_last ranks what goes:
+    # the newest two stay, the older two are selected.
+    answer = retrieval_log.prune_retrievals(older_than=cutoff, keep_last="2")
+    assert answer["selected"] == 2
+    assert answer["oldest"] == "2026-09-15 08:00:00"
+    assert answer["newest"] == "2026-09-15 09:00:00"
+
+    # a cutoff all rows sit inside selects nothing on its own; combined it
+    # intersects — the row count alone (keep_last) never overrides the age rule
+    fresh = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat(
+        timespec="seconds"
+    )[:19]
+    both = retrieval_log.prune_retrievals(older_than=fresh, keep_last="2")
+    assert both["selected"] == 0 and both["remaining"] == 4
+    older_only = retrieval_log.prune_retrievals(older_than=fresh)
+    assert older_only["selected"] == 0
+
+
+def test_prune_applies_and_writes_one_ledger_line(tmp_path, monkeypatch):
+    seed(tmp_path, monkeypatch, standard_rows())
+    ledger = retrieval_log.retrieval_ledger_path()
+
+    answer = retrieval_log.prune_retrievals(keep_last="2", dry_run=False)
+    assert answer["deleted"] == 2 and answer["dry_run"] is False
+    assert answer["remaining"] == 2
+    kept = retrieval_log.query_retrievals()
+    assert sorted(row["query"] for row in kept["rows"]) == ["q-four", "q-three"]
+
+    lines = ledger.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "# Retrieval log ledger"
+    entries = [line for line in lines if line.startswith("- ")]
+    assert len(entries) == 1
+    assert "| pruned |" in entries[0]
+    assert "keep_last=2" in entries[0] and "2 rows" in entries[0]
+
+    # a second applied prune appends a second line, never rewrites the file
+    retrieval_log.prune_retrievals(agent_role="supervisor", keep_last="0", dry_run=False)
+    entries = [
+        line for line in ledger.read_text(encoding="utf-8").splitlines()
+        if line.startswith("- ")
+    ]
+    assert len(entries) == 2
+
+
+def test_prune_filters_narrow_the_selection_like_query(tmp_path, monkeypatch):
+    seed(tmp_path, monkeypatch, standard_rows())
+
+    # only dpmtf rows are candidates: the 'other' row survives although older
+    # than the oldest selected dpmtf row, exactly like a query filter
+    answer = retrieval_log.prune_retrievals(scope="dpmtf", keep_last="1", dry_run=False)
+    assert answer["selected"] == 2 and answer["remaining"] == 2
+    assert answer["by_scope"] == {"dpmtf": 2}
+    assert answer["by_agent_role"] == {"dsh": 2}
+    assert answer["oldest"] == "2026-09-15 08:00:00"
+    assert answer["newest"] == "2026-09-15 10:00:00"
+    assert retrieval_log.query_retrievals()["total"] == 2
+
+    role_only = retrieval_log.prune_retrievals(agent_role="supervisor", keep_last="0")
+    assert role_only["selected"] == 1 and role_only["remaining"] == 1
+    assert role_only["by_agent_role"] == {"supervisor": 1}
+    assert role_only["by_scope"] == {"other": 1}
+    assert role_only["oldest"] == "2026-09-15 09:00:00"
+
+
+def test_prune_on_a_missing_database_is_the_empty_state(tmp_path, monkeypatch):
+    write_ini(tmp_path, monkeypatch, db_name="gone/knowledge.db")
+
+    answer = retrieval_log.prune_retrievals(older_than="30")
+    assert answer == {
+        "selected": 0, "deleted": 0, "dry_run": True, "oldest": None,
+        "newest": None, "by_scope": {}, "by_agent_role": {}, "remaining": 0,
+    }
+    applied = retrieval_log.prune_retrievals(keep_last="1", dry_run=False)
+    assert applied["selected"] == 0 and applied["remaining"] == 0
+
+    assert not (tmp_path / "gone").exists()  # pruning never creates the file
+    assert not retrieval_log.retrieval_ledger_path().exists()
+
+
+def test_cli_retrievals_still_lists_without_a_sub_verb(tmp_path, monkeypatch, capsys):
+    seed(tmp_path, monkeypatch, standard_rows())
+
+    assert cli.main(["retrievals"]) == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 4
+    assert lines[0].startswith("2026-09-15 11:00:00")
+    assert cli.main(["retrievals", "--summary"]) == 0
+    assert "retrievals" in capsys.readouterr().out
+
+    assert cli.main(["retrievals", "prune", "--keep-last", "2"]) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0].startswith("dry run")
+    assert "selected" in out
+    assert retrieval_log.query_retrievals()["total"] == 4
+
+    assert cli.main(["retrievals", "prune", "--older-than", "30", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True and payload["selected"] == 0
+
+    assert cli.main(
+        ["retrievals", "prune", "--keep-last", "2", "--apply"]
+    ) == 0
+    out = capsys.readouterr().out
+    assert "| pruned |" in out
+    assert retrieval_log.query_retrievals()["total"] == 2
+    assert retrieval_log.retrieval_ledger_path().is_file()
+
+    assert cli.main(["retrievals", "prune"]) == 2
+    assert "--older-than" in capsys.readouterr().err

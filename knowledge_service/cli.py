@@ -2,7 +2,7 @@
 
 Invoked as ``python -m knowledge_service.cli <command>``. Commands:
 ``serve``, ``refresh``, ``refresh-all``, ``scopes``, ``set-repository``,
-``retrievals``,
+``retrievals`` (lists rows; ``retrievals prune`` prunes the log),
 ``grant``, ``revoke``,
 ``import-registry``, ``download-model``, ``learning`` (with subcommands
 ``validate``, ``validate-run``, ``admit``, ``admit-run``, ``drafts``,
@@ -462,8 +462,68 @@ def _cmd_learning(args: argparse.Namespace) -> int:
     return _fail(f"unknown learning command: {command!r}")
 
 
+def _cmd_retrievals_prune(args: argparse.Namespace) -> int:
+    """Report what a prune would remove; delete only with ``--apply``.
+
+    Without ``--older-than`` or ``--keep-last`` the command refuses with exit
+    code 2, because a prune without a selection rule would be a full wipe.
+    Without ``--apply`` it is a dry run and says so in the first line; with
+    ``--apply`` it deletes, prints the same report plus the ledger line it
+    appended to ``RETRIEVAL-LEDGER.md``.
+    """
+    filters = {
+        name: value
+        for name, value in {
+            "older_than": args.older_than,
+            "keep_last": args.keep_last,
+            "run_id": args.run_id,
+            "flow_key": args.flow_key,
+            "agent_role": args.agent_role,
+            "scope": args.scope,
+        }.items()
+        if value is not None
+    }
+    if args.older_than is None and args.keep_last is None:
+        print(
+            "knowledge-service: error: prune needs a selection rule:"
+            " pass --older-than and/or --keep-last",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        answer = retrieval_log.prune_retrievals(**filters, dry_run=not args.apply)
+    except ValueError as exc:
+        print(f"knowledge-service: error: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(answer))
+        return 0
+    if answer["dry_run"]:
+        print(
+            f"dry run: {answer['selected']} row(s) would be pruned;"
+            " add --apply to delete"
+        )
+    else:
+        print(f"deleted: {answer['deleted']} row(s) pruned")
+    width = max(len(key) for key in answer)
+    for key, value in answer.items():
+        rendered = json.dumps(value) if isinstance(value, dict) else str(value)
+        print(f"{key.ljust(width)} {rendered}")
+    if not answer["dry_run"]:
+        ledger = retrieval_log.retrieval_ledger_path()
+        try:
+            last_line = ledger.read_text(encoding="utf-8").splitlines()[-1]
+        except OSError:
+            last_line = ""
+        if last_line:
+            print(f"ledger: {last_line}")
+    return 0
+
+
 def _cmd_retrievals(args: argparse.Namespace) -> int:
     """Print retrieval-log rows, aligned summary lines, or the raw dict."""
+    if args.verb == "prune":
+        return _cmd_retrievals_prune(args)
     filters = {
         name: value
         for name, value in {
@@ -548,6 +608,13 @@ def build_parser() -> argparse.ArgumentParser:
     retrievals = subparsers.add_parser(
         "retrievals", help="read the retrieval log (rows, summary or JSON)"
     )
+    retrievals.add_argument(
+        "verb",
+        nargs="?",
+        default=None,
+        choices=["prune"],
+        help="with 'prune' report/delete old rows; without it list the log",
+    )
     retrievals.add_argument("--run-id", default=None, help="filter by run id")
     retrievals.add_argument("--handoff-id", default=None, help="filter by handoff")
     retrievals.add_argument("--flow-key", default=None, help="filter by flow key")
@@ -564,6 +631,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retrievals.add_argument(
         "--json", action="store_true", help="print the raw answer dict"
+    )
+    retrievals.add_argument(
+        "--older-than", default=None,
+        help="ISO-8601 timestamp or plain day count; rows strictly older"
+        " are selected",
+    )
+    retrievals.add_argument(
+        "--keep-last", default=None,
+        help="row count; every row except the newest N is selected",
+    )
+    retrievals.add_argument(
+        "--apply", action="store_true",
+        help="delete the selection; without it the prune is a dry run",
     )
     retrievals.set_defaults(handler=_cmd_retrievals)
 

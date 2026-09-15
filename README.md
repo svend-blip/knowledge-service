@@ -243,6 +243,38 @@ Rows print tab-separated (`created_at`, scope, role, flow, run, handoff,
 result/token/duration counts, query truncated to 60 characters);
 `--summary` prints aligned `key value` totals and `--json` the raw answer.
 
+### Pruning
+
+The log is pruned from the CLI, never casually: `retrievals prune` selects
+rows with two rules that intersect — a row must satisfy **both** to be
+selected. `--older-than` is an ISO-8601 timestamp or a plain day count
+(`30` means 30 days before now, UTC) and selects rows whose `created_at`
+is strictly older; `--keep-last` is a row count and selects every candidate
+except the newest N. Together, `--older-than 30 --keep-last 1000` keeps
+anything younger than 30 days *and* the newest thousand. `--run-id`,
+`--flow-key`, `--agent-role` and `--scope` narrow the candidates exactly
+like the listing filters. Without `--older-than` or `--keep-last` the
+command refuses with exit code 2 rather than wiping the table.
+
+```sh
+# what would a conservative prune remove?
+python -m knowledge_service.cli retrievals prune \
+    --older-than 30 --keep-last 1000
+
+# same, but actually delete and record it
+python -m knowledge_service.cli retrievals prune \
+    --older-than 30 --keep-last 1000 --apply
+```
+
+The prune defaults to a dry run: the first line says `dry run`, reports the
+selected count with its oldest/newest stamps and per-scope/per-role
+breakdown, and touches nothing. With `--apply` the selection is deleted in
+one transaction and one audit line is appended to
+`<learning_dir>/RETRIEVAL-LEDGER.md` (created on first use, header
+`# Retrieval log ledger`): stamp, `pruned`, the row count, the oldest..newest
+span and the filters as given. Pruning is deliberately an operator act at
+the host, not an HTTP call, so there is intentionally no route for it.
+
 ## Running the tests
 
 ```sh
