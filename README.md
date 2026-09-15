@@ -212,6 +212,37 @@ The service is a `simple` unit; the timer runs `refresh-all --from-registry`
 daily, and both units are `Nice=10` so retrieval never competes with a local
 model for the GPU.
 
+## Retrieval log
+
+Every real provider retrieval appends one row to `knowledge_retrieval_log`:
+provider, scope, query, result count, JSON source list, retrieved token
+count, duration in milliseconds, agent role, run id, handoff id, flow key,
+and the `created_at` timestamp. `GET /v1/retrievals` reads those rows with
+the same token header as every other route: the optional filters `run_id`,
+`handoff_id`, `flow_key`, `agent_role`, `scope`, `since` and `until` combine
+with AND, `limit` (default 50, capped at 500) and `offset` page the answer
+newest-first, and `summary=true` returns totals instead of rows. A bad
+`limit`, `offset` or timestamp is a 400 naming the parameter; a missing
+database is the empty result, never an error. The CLI reads the same data
+through `retrievals`:
+
+```sh
+# what did this run retrieve?
+python -m knowledge_service.cli retrievals --run-id 046
+
+# what has this role retrieved today?
+python -m knowledge_service.cli retrievals --agent-role dsh \
+    --since 2026-09-15T00:00:00
+
+# how much did scope dpmtf-webui serve this week?
+python -m knowledge_service.cli retrievals --scope dpmtf-webui \
+    --since 2026-09-08T00:00:00 --summary
+```
+
+Rows print tab-separated (`created_at`, scope, role, flow, run, handoff,
+result/token/duration counts, query truncated to 60 characters);
+`--summary` prints aligned `key value` totals and `--json` the raw answer.
+
 ## Running the tests
 
 ```sh

@@ -2,6 +2,7 @@
 
 Invoked as ``python -m knowledge_service.cli <command>``. Commands:
 ``serve``, ``refresh``, ``refresh-all``, ``scopes``, ``set-repository``,
+``retrievals``,
 ``grant``, ``revoke``,
 ``import-registry``, ``download-model``, ``learning`` (with subcommands
 ``validate``, ``validate-run``, ``admit``, ``admit-run``, ``drafts``,
@@ -12,6 +13,7 @@ clear line on stderr and exit code 1 — never a traceback.
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -20,6 +22,7 @@ from knowledge_service import config, db
 from knowledge_service import maintenance as knowledge_maintenance
 from knowledge_service import indexer as knowledge_indexer
 from knowledge_service import learning as knowledge_learning
+from knowledge_service import retrieval_log
 from knowledge_service.provider import ProviderNotReady
 
 __all__ = ["main"]
@@ -459,6 +462,53 @@ def _cmd_learning(args: argparse.Namespace) -> int:
     return _fail(f"unknown learning command: {command!r}")
 
 
+def _cmd_retrievals(args: argparse.Namespace) -> int:
+    """Print retrieval-log rows, aligned summary lines, or the raw dict."""
+    filters = {
+        name: value
+        for name, value in {
+            "run_id": args.run_id,
+            "handoff_id": args.handoff_id,
+            "flow_key": args.flow_key,
+            "agent_role": args.agent_role,
+            "scope": args.scope,
+            "since": args.since,
+            "until": args.until,
+        }.items()
+        if value is not None
+    }
+    if args.summary:
+        answer = retrieval_log.summarise_retrievals(**filters)
+    else:
+        answer = retrieval_log.query_retrievals(
+            limit=args.limit, offset=args.offset, **filters
+        )
+    if args.json:
+        print(json.dumps(answer))
+        return 0
+    if args.summary:
+        width = max(len(key) for key in answer)
+        for key, value in answer.items():
+            rendered = json.dumps(value) if isinstance(value, dict) else str(value)
+            print(f"{key.ljust(width)} {rendered}")
+        return 0
+    for row in answer["rows"]:
+        fields = [
+            row.get("created_at"),
+            row.get("scope"),
+            row.get("agent_role"),
+            row.get("flow_key"),
+            row.get("run_id"),
+            row.get("handoff_id"),
+            row.get("result_count"),
+            row.get("retrieved_token_count"),
+            row.get("retrieval_duration_ms"),
+            str(row.get("query") or "")[:60],
+        ]
+        print("\t".join("" if field is None else str(field) for field in fields))
+    return 0
+
+
 # ── parser ──────────────────────────────────────────────────────────────
 
 
@@ -494,6 +544,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     scopes = subparsers.add_parser("scopes", help="list the index registry")
     scopes.set_defaults(handler=_cmd_scopes)
+
+    retrievals = subparsers.add_parser(
+        "retrievals", help="read the retrieval log (rows, summary or JSON)"
+    )
+    retrievals.add_argument("--run-id", default=None, help="filter by run id")
+    retrievals.add_argument("--handoff-id", default=None, help="filter by handoff")
+    retrievals.add_argument("--flow-key", default=None, help="filter by flow key")
+    retrievals.add_argument(
+        "--agent-role", default=None, help="filter by agent role"
+    )
+    retrievals.add_argument("--scope", default=None, help="filter by scope")
+    retrievals.add_argument("--since", default=None, help="ISO-8601 lower bound")
+    retrievals.add_argument("--until", default=None, help="ISO-8601 upper bound")
+    retrievals.add_argument("--limit", type=int, default=50, help="page size")
+    retrievals.add_argument("--offset", type=int, default=0, help="page start")
+    retrievals.add_argument(
+        "--summary", action="store_true", help="totals instead of rows"
+    )
+    retrievals.add_argument(
+        "--json", action="store_true", help="print the raw answer dict"
+    )
+    retrievals.set_defaults(handler=_cmd_retrievals)
 
     set_repository = subparsers.add_parser(
         "set-repository", help="record a scope's repository directory"

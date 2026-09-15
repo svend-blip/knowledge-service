@@ -529,6 +529,67 @@ def create_app():
             drafts = [item for item in drafts if not item["admitted"]]
         return {"drafts": drafts}
 
+    @application.get("/v1/retrievals")
+    async def retrievals_route(
+        run_id: str | None = None,
+        handoff_id: str | None = None,
+        flow_key: str | None = None,
+        agent_role: str | None = None,
+        scope: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: str | None = None,
+        offset: str | None = None,
+        summary: bool = False,
+        _token: None = Depends(require_token),
+    ) -> dict:
+        """Read the retrieval log: matching rows, or totals with ``summary=true``.
+
+        Read-only, no scope guard: the log is operator data, not passage
+        content. Paging and timestamps are checked here so a bad parameter is
+        a 400 naming itself rather than a silent default.
+        """
+        from datetime import datetime
+        from fastapi import HTTPException
+
+        paging: dict = {}
+        if limit is not None:
+            try:
+                paging["limit"] = int(limit)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400, detail=f"limit must be an integer: {limit!r}"
+                ) from None
+        if offset is not None:
+            try:
+                paging["offset"] = int(offset)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400, detail=f"offset must be an integer: {offset!r}"
+                ) from None
+        for name, value in (("since", since), ("until", until)):
+            if value is None:
+                continue
+            try:
+                datetime.fromisoformat(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400, detail=f"{name} must be ISO-8601: {value!r}"
+                ) from None
+
+        filters = {
+            "run_id": run_id,
+            "handoff_id": handoff_id,
+            "flow_key": flow_key,
+            "agent_role": agent_role,
+            "scope": scope,
+            "since": since,
+            "until": until,
+        }
+        if summary:
+            return retrieval_log.summarise_retrievals(**filters)
+        return retrieval_log.query_retrievals(**filters, **paging)
+
     @application.get("/v1/scope-for-path")
     async def scope_for_path_route(
         path: str = "",
