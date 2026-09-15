@@ -1,86 +1,106 @@
-# SCOPE — knowledge-service A2-5: admission normalises the two schema slips decomposers make
+# SCOPE — knowledge-service A2-6: the retrieval log is readable
 
 Treat this file as the complete project scope for this workspace
 (`/home/svend/knowledge-service`). Re-initialise scope-mcp (`init_project`
 with `reset: true`), ask only what is genuinely necessary, then build. The
-service is live on `http://127.0.0.1:9140` from commit `e5e375c`; four
-artifacts are admitted.
+service is live on `http://127.0.0.1:9140` from commit `92bbbd3`; its
+`knowledge_retrieval_log` holds 641 rows and nothing can read them.
 
 ## 1. Purpose
 
-Every LEARNING-DRAFT.yaml a chain decomposer has written so far (four out
-of four, two repositories, two model vendors) failed `validate` on the
-same two slips and had to be hand-edited by the supervisor before
-`admit-run`: `architecture_implications` written as one string instead of
-a one-item list, and `validation.testgoals` written as a list of ids
-instead of the `"n/m green"` string. The schema stays strict (the artifact
-on disk is always canonical), but admission should carry the two
-mechanical fixes itself, visibly.
+Every search writes one row (`provider`, `scope`, `query`, `result_count`,
+`sources` JSON, `retrieved_token_count`, `retrieval_duration_ms`,
+`agent_role`, `run_id`, `handoff_id`, `created_at`, `flow_key`), but the
+service exposes no way to read them: `GET /v1/scopes` lists the registry,
+`/v1/learning` the artifacts, and the log is reachable only with `sqlite3`
+on the host. Addendum 2 §7 promises the operator can "list what a given run
+retrieved", and the criterion-7 measurement of 2026-09-15 went looking for
+exactly that and found DPMtF's local log instead, which is empty when a
+role retrieves through mcp-light. Make the log readable, with the same
+read-only, parameterized discipline as the rest of the service.
 
 ## 2. Deliverable
 
-### 2.1 Normalisation (`knowledge_service/learning.py`)
+### 2.1 Query function (`knowledge_service/retrieval_log.py`)
 
-- `normalise(doc) -> tuple[dict, list[str]]`: returns a copy with, when
-  present, (a) a scalar `architecture_implications`, `failed_approaches`
-  or `important_files` wrapped into a one-item list (an empty string
-  becomes an empty list), (b) `validation.testgoals` given as a list of
-  ids turned into `"<n>/<n> green"` (n = its length), (c) `family` and
-  `run` given as integers turned into zero-padded strings only when the
-  draft's own run directory name is zero-padded (else plain strings), and
-  a list of one human sentence per change. Anything else is untouched;
-  `validate` still runs on the result.
-- `admit_run` and `admit` apply `normalise` before `validate` (the
-  file on disk is never modified; the admitted artifact is the normalised
-  document), and every change becomes its own ledger line
-  `| normalised | <repository>/<family>/<run> | <sentence>` written
-  before the `admitted` line. `validate_run` prints the sentences under
-  `would normalise:` before the violations of the normalised document,
-  so a supervisor sees what admission will change.
-- `--strict` on `admit-run` and `admit` disables normalisation (the
-  document must validate as written).
+`query_retrievals(*, run_id=None, handoff_id=None, flow_key=None, agent_role=None, scope=None, since=None, until=None, limit=50, offset=0) -> dict`
 
-### 2.2 Route
+- Every filter is optional and combines with AND; `since`/`until` are
+  ISO-8601 strings compared against `created_at`; unknown/None filters are
+  simply absent from the WHERE clause. Parameterized SQL only.
+- `limit` is clamped to 1..500 (default 50), `offset` to >= 0.
+- Returns `{"rows": [...], "total": <int>, "limit": n, "offset": n}` where
+  `total` is the count matching the filters before the limit, and each row
+  carries every column with `sources` decoded from JSON into a list (a row
+  whose `sources` does not parse yields `[]` and is not an error).
+- Newest first (`created_at DESC, id DESC`).
+- Read-only: it opens the configured database read-only and never creates
+  it; a missing database or table is the empty state
+  (`{"rows": [], "total": 0, ...}`), never an exception.
 
-`GET /v1/learning/drafts` rows gain `normalisations` (the sentences, empty
-when none) and `valid` reflects the normalised document; `violations`
-counts what remains after normalisation.
+`summarise_retrievals(*, run_id=None, flow_key=None, ...same filters...) -> dict`
+returns `{"retrievals": n, "results": n, "tokens": n, "duration_ms": n,
+"scopes": {scope: n}, "agent_roles": {role: n}, "first": iso|None,
+"last": iso|None}` over the matching rows (no limit).
 
-### 2.3 Tests, named exactly (in `tests/test_learning.py`)
+### 2.2 Route (`knowledge_service/app.py`)
 
-- `test_normalise_wraps_scalars_and_rewrites_testgoals_and_reports_each_change`
-- `test_admit_run_normalises_and_ledgers_before_admitting`
-  (draft with both slips on disk → admitted artifact canonical, draft
-  file byte-identical, two `normalised` lines then one `admitted` line)
-- `test_strict_admission_refuses_what_normalisation_would_fix`
-- `test_drafts_route_reports_normalisations_and_post_normalisation_validity`
+`GET /v1/retrievals` with the same query parameters plus `summary=true`
+(default false): `summary=false` answers `query_retrievals`'s dict,
+`summary=true` answers `summarise_retrievals`'s dict. Read-only, no scope
+guard (the log is operator data, not passage content), the token header
+applies as on every other route. Invalid `limit`/`offset`/timestamps are a
+400 naming the parameter.
+
+### 2.3 CLI (`knowledge_service/cli.py`)
+
+`retrievals [--run-id X] [--handoff-id X] [--flow-key X] [--agent-role X]
+[--scope X] [--since ISO] [--until ISO] [--limit N] [--offset N]
+[--summary] [--json]`: tab-separated lines
+(`created_at, scope, agent_role, flow_key, run_id, handoff_id,
+result_count, retrieved_token_count, retrieval_duration_ms, query`
+truncated to 60 characters) or, with `--summary`, the summary as aligned
+`key value` lines; `--json` prints the function's dict verbatim.
 
 ### 2.4 README
 
-`## Validated learning`: three sentences on normalisation, the ledger
-lines and `--strict`.
+`## Retrieval log`: what a row holds, the route with its parameters, the
+CLI with one example per question an operator actually asks ("what did
+this run retrieve", "what has this role retrieved today", "how much did
+scope X serve this week").
+
+### 2.5 Tests, named exactly (in `tests/test_knowledge_service.py` or a new `tests/test_retrieval_log_query.py`)
+
+- `test_query_filters_combine_and_page_newest_first`
+- `test_query_decodes_sources_and_survives_a_malformed_row`
+- `test_summary_counts_totals_per_scope_and_role`
+- `test_retrievals_route_answers_rows_and_summary_and_400s_on_bad_paging`
+- `test_query_on_a_missing_database_is_the_empty_state`
+- `test_cli_retrievals_prints_lines_and_summary`
+
+Every existing test stays green.
 
 ## 3. Constraints
 
-As before: work only here; never modify DPMtF, mcp-light, the shared
-index directory or `~/.local/share/knowledge-service/`; no commits; no
-network; interpreter `/home/svend/DPMtF-WebUI/venv/bin/python`; no new
-dependencies; en-US; no services or models touched; `py_compile` every
-changed file; the 67 existing tests stay green. The live service on 9140
-keeps running and is not restarted by you. Never read or write under any
-real `.flowrunner/` — tests use temp roots.
+As before: work only here; never modify DPMtF, mcp-light, the shared index
+directory or `~/.local/share/knowledge-service/`; no commits; no network;
+interpreter `/home/svend/DPMtF-WebUI/venv/bin/python`; no new dependencies;
+parameterized SQL; en-US; no services or models touched; `py_compile` every
+changed file; the 71 existing tests stay green. The live service on 9140
+keeps running and is not restarted by you. Tests use temp databases only —
+never the operator's.
 
 ## 4. Definition of Done
 
 ```testgoals
 id: TG1
-what: the four named tests exist and pass and the whole suite is green
-run: cd /home/svend/knowledge-service && for t in normalise_wraps_scalars_and_rewrites_testgoals_and_reports_each_change admit_run_normalises_and_ledgers_before_admitting strict_admission_refuses_what_normalisation_would_fix drafts_route_reports_normalisations_and_post_normalisation_validity; do grep -q "def test_$t" tests/test_learning.py || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
+what: the six named tests exist and pass and the whole suite is green
+run: cd /home/svend/knowledge-service && for t in query_filters_combine_and_page_newest_first query_decodes_sources_and_survives_a_malformed_row summary_counts_totals_per_scope_and_role retrievals_route_answers_rows_and_summary_and_400s_on_bad_paging query_on_a_missing_database_is_the_empty_state cli_retrievals_prints_lines_and_summary; do grep -rq "def test_$t" tests/ || exit 1; done && PYTHONDONTWRITEBYTECODE=1 /home/svend/DPMtF-WebUI/venv/bin/python -m pytest -q -p no:cacheprovider tests 2>&1 | tail -n 1 | grep -E "passed" | grep -vE "failed|error"
 expect: exit 0
 
 id: TG2
-what: normalise exists, admission ledgers it, strict is a flag, the route carries it, the README says so
-run: cd /home/svend/knowledge-service && grep -q "def normalise" knowledge_service/learning.py && grep -q '"normalised"' knowledge_service/learning.py && grep -q '"--strict"' knowledge_service/cli.py && grep -q "normalisations" knowledge_service/app.py && grep -q -i "normalis" README.md
+what: the functions, the route and the CLI verb exist and the README documents them
+run: cd /home/svend/knowledge-service && grep -q "def query_retrievals" knowledge_service/retrieval_log.py && grep -q "def summarise_retrievals" knowledge_service/retrieval_log.py && grep -q "/v1/retrievals" knowledge_service/app.py && grep -q '"retrievals"' knowledge_service/cli.py && grep -q "^## Retrieval log" README.md
 expect: exit 0
 
 id: TG3
@@ -89,14 +109,14 @@ run: cd /home/svend/knowledge-service && test -n "$(git status --porcelain)" && 
 expect: exit 0
 
 id: TG4
-what: LIVE (reviewer only) — after the service restart, validate-run on a real draft with a slip shows the normalisation sentence and admit-run of the next real draft needs no hand edit
-run: test -f /tmp/claude-1000/-home-svend-DPMtF-WebUI/e20394ae-27d0-4204-804f-5d6a2f5da054/scratchpad/a2-5-live/ok
+what: LIVE (reviewer only) — after the restart, the route and the CLI answer over the operator's 641 rows and the run-046 sessions' retrievals are findable
+run: test -f /tmp/claude-1000/-home-svend-DPMtF-WebUI/e20394ae-27d0-4204-804f-5d6a2f5da054/scratchpad/a2-6-live/ok
 expect: exit 0
 ```
 
 ## 5. Initial Execution Instruction
 
-`init_project` with `reset: true`; goals for 2.1–2.4 in order; checkpoint
+`init_project` with `reset: true`; goals for 2.1–2.5 in order; checkpoint
 after each goal; ask now, in one message, only what is genuinely ambiguous;
 implement; run TG1–TG3 and `py_compile`; record coverage;
 `complete_project`; report `git status` and the pasted output of TG1–TG3.
