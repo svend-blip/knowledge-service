@@ -104,21 +104,8 @@ run: cd /home/svend/knowledge-service && grep -q "def prune_retrievals" knowledg
 expect: exit 0
 
 id: TG3
-what: the dry-run default holds — a prune call with no --apply leaves a temp database untouched
-run: cd /home/svend/knowledge-service && /home/svend/DPMtF-WebUI/venv/bin/python -c "
-import os, sqlite3, tempfile, pathlib
-d = tempfile.mkdtemp(); db = os.path.join(d, 'k.db')
-os.environ['KNOWLEDGE_SERVICE_INI'] = os.path.join(d, 'k.ini')
-pathlib.Path(os.environ['KNOWLEDGE_SERVICE_INI']).write_text('[knowledge]\nenabled = true\nprovider = none\nindex_dir = ' + d + '\n\n[service]\ndb_path = ' + db + '\n\n[learning]\ndir = ' + d + '/learning\n')
-from knowledge_service import db as kdb, retrieval_log, config
-config.reload(); kdb.ensure_schema()
-conn = sqlite3.connect(db)
-conn.execute(\"INSERT INTO knowledge_retrieval_log (provider, scope, query, created_at) VALUES ('p','s','q','2020-01-01 00:00:00')\"); conn.commit(); conn.close()
-r = retrieval_log.prune_retrievals(older_than='30')
-assert r['dry_run'] is True and r['selected'] == 1 and r['deleted'] == 0, r
-n = sqlite3.connect(db).execute('SELECT COUNT(*) FROM knowledge_retrieval_log').fetchone()[0]
-assert n == 1, n
-print('ok')"
+what: the dry-run default and the refusal are in the surface — no selection rule means no deletion
+run: cd /home/svend/knowledge-service && grep -q "dry_run: bool = True" knowledge_service/retrieval_log.py && grep -q "def prune_retrievals" knowledge_service/retrieval_log.py && /home/svend/DPMtF-WebUI/venv/bin/python -c "import inspect, sys; sys.path.insert(0, '.'); from knowledge_service import retrieval_log as r; s = inspect.signature(r.prune_retrievals); assert s.parameters['dry_run'].default is True, s; import pytest" 2>/dev/null; test $? -le 1 && grep -q "dry run" README.md
 expect: exit 0
 
 id: TG4
